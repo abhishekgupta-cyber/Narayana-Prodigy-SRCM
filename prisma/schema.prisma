@@ -1,0 +1,589 @@
+// ============================================================================
+// Prisma Schema: Narayana Prodigy Student Relation Call Management CRM
+// Full Section 3 Production Data Model with PostgreSQL Optimization
+// ============================================================================
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["fullTextSearchPostgres"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------------------------------------------------------
+// ENUMS
+// ----------------------------------------------------------------------------
+enum Role {
+  SUPER_ADMIN
+  MENTOR
+}
+
+enum UserStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum TaskStatus {
+  ASSIGNED
+  ATTEMPTED
+  COMPLETED
+  CANCELLED
+}
+
+enum CallDisposition {
+  CONNECTED
+  BUSY
+  SWITCHED_OFF
+  NOT_REACHABLE
+  RINGING_NO_RESPONSE
+  CALLBACK_REQUESTED
+  INVALID_NUMBER
+  WRONG_NUMBER
+  PARENT_BUSY
+}
+
+enum CallActivityType {
+  INITIAL_SUBMIT
+  INBOUND_UPDATE
+  ATTEMPT_ADDED
+  REMINDER_CHANGED
+}
+
+enum ContactType {
+  PRIMARY
+  ALTERNATE
+}
+
+enum ReminderStatus {
+  PENDING
+  DONE
+  CLEARED
+}
+
+enum AttendanceStatus {
+  P // Present
+  A // Absent
+  L // Leave
+}
+
+enum AttendanceLeaveRule {
+  EXCLUDE
+  COUNT_AS_ABSENT
+  COUNT_AS_PRESENT
+}
+
+enum MatchStatus {
+  PENDING
+  MERGED
+  DISMISSED
+}
+
+enum UploadBatchType {
+  ADMISSION
+  EXAM
+  ATTENDANCE
+  LEADS
+}
+
+enum UploadBatchStatus {
+  PENDING
+  PROCESSING
+  SUCCESS
+  PARTIAL
+  FAILED
+  ROLLED_BACK
+}
+
+enum ImportErrorCategory {
+  INVALID
+  UNMATCHED
+  AMBIGUOUS
+  CLASH
+}
+
+// ----------------------------------------------------------------------------
+// 1. USER & STAFF (Section 4.2)
+// ----------------------------------------------------------------------------
+model User {
+  id                   String      @id @default(uuid())
+  full_name            String
+  designation          String?     // e.g., Senior Academic Mentor, Student Relation Officer
+  mobile               String?     @unique
+  username             String      @unique
+  email                String      @unique
+  password_hash        String      // bcrypt cost 12
+  role                 Role        @default(MENTOR)
+  status               UserStatus  @default(ACTIVE)
+  must_change_password Boolean     @default(true)
+  failed_logins        Int         @default(0)
+  locked_until         DateTime?
+  daily_call_goal      Int         @default(60)
+  created_at           DateTime    @default(now())
+  updated_at           DateTime    @updatedAt
+
+  enrollments_owned    Enrollment[]         @relation("MentorEnrollments")
+  campaign_mentors     CampaignMentor[]
+  call_tasks           CallTask[]           @relation("MentorTasks")
+  call_logs            CallLog[]            @relation("MentorLogs")
+  call_activities      CallActivity[]
+  reminders            Reminder[]
+  audit_logs           AuditLog[]
+  import_templates     ImportTemplate[]
+  upload_batches       UploadBatch[]
+
+  @@index([role, status])
+  @@index([username])
+  @@index([mobile])
+}
+
+// ----------------------------------------------------------------------------
+// 2. ACADEMIC SESSION (Section 5)
+// ----------------------------------------------------------------------------
+model AcademicSession {
+  id          String   @id @default(uuid())
+  name        String   @unique // e.g., "2025-26", "2026-27", "2027-28"
+  start_month Int      @default(4) // April
+  is_active   Boolean  @default(true)
+  created_at  DateTime @default(now())
+
+  enrollments         Enrollment[]
+  campaigns           Campaign[]
+  call_tasks          CallTask[]
+  call_logs           CallLog[]
+  upload_batches      UploadBatch[]
+
+  @@index([is_active])
+}
+
+// ----------------------------------------------------------------------------
+// 3. STUDENT IDENTITY (StudentProfile - Section 8)
+// ----------------------------------------------------------------------------
+model StudentProfile {
+  id                 String    @id @default(uuid())
+  student_name       String
+  father_name        String
+  mother_name        String?
+  primary_mobile     String    // 10 digits normalized
+  alternate_mobile   String?   // 10 digits normalized
+  email              String?
+  gender             String?
+  dob                DateTime?
+  govt_id_encrypted  String?   // Encrypted. Admin sees last 4 only; never in mentor APIs
+  govt_id_last4      String?
+  address            String?
+  city               String?
+  state              String?
+  district           String?
+  pin                String?
+  person_key         String    @unique // lower(name)|lower(father)|last-10-digits mobile
+  created_at         DateTime  @default(now())
+  updated_at         DateTime  @updatedAt
+
+  enrollments        Enrollment[]
+  possible_matches   PossibleMatch[]
+
+  @@index([primary_mobile])
+  @@index([person_key])
+}
+
+// ----------------------------------------------------------------------------
+// 4. COURSE ENROLLMENT (Admission Seat - D1, D2, D14)
+// ----------------------------------------------------------------------------
+model Enrollment {
+  id                    String           @id @default(uuid())
+  admission_no          String           // Unique where deleted_at IS NULL
+  profile_id            String
+  academic_session_id   String
+  course_name           String
+  course_type           String?
+  course_group          String?
+  course_class          String?
+  course_category       String?
+  batch_name            String           @default("General Batch")
+  mentor_id             String?          // Matched mentor user
+  raw_mentor_name       String?          // Unmatched string from upload sheet
+  admission_date        DateTime?
+  last_connected_at     DateTime?
+  last_call_at          DateTime?
+  latest_result_summary Json?
+  upload_batch_id       String?
+  created_at            DateTime         @default(now())
+  updated_at            DateTime         @updatedAt
+  deleted_at            DateTime?
+  deleted_by            String?
+
+  profile               StudentProfile   @relation(fields: [profile_id], references: [id], onDelete: Cascade)
+  academic_session      AcademicSession  @relation(fields: [academic_session_id], references: [id])
+  mentor                User?            @relation("MentorEnrollments", fields: [mentor_id], references: [id], onDelete: SetNull)
+  upload_batch          UploadBatch?     @relation(fields: [upload_batch_id], references: [id], onDelete: SetNull)
+
+  call_tasks            CallTask[]
+  call_logs             CallLog[]
+  reminders             Reminder[]
+  exam_results          ExamResult[]
+  attendance_records    AttendanceRecord[]
+  attendance_summaries  AttendanceSummary[]
+  possible_matches      PossibleMatch[]
+
+  @@unique([admission_no, deleted_at], name: "uq_active_admission_no")
+  @@index([admission_no])
+  @@index([profile_id])
+  @@index([mentor_id, academic_session_id])
+  @@index([academic_session_id, batch_name])
+  @@index([academic_session_id, course_name])
+  @@index([deleted_at])
+}
+
+// ----------------------------------------------------------------------------
+// 5. UPLOAD CENTER & BATCH MANAGEMENT (Section 7.6 Rollback)
+// ----------------------------------------------------------------------------
+model UploadBatch {
+  id              String             @id @default(uuid())
+  type            UploadBatchType
+  session_id      String
+  template_id     String?
+  file_name       String
+  uploaded_by     String
+  status          UploadBatchStatus  @default(PENDING)
+  total_rows      Int                @default(0)
+  inserted_count  Int                @default(0)
+  updated_count   Int                @default(0)
+  unmatched_count Int                @default(0)
+  error_count     Int                @default(0)
+  created_at      DateTime           @default(now())
+
+  session         AcademicSession    @relation(fields: [session_id], references: [id])
+  uploader        User               @relation(fields: [uploaded_by], references: [id])
+  template        ImportTemplate?    @relation(fields: [template_id], references: [id])
+
+  enrollments     Enrollment[]
+  exam_results    ExamResult[]
+  attendance      AttendanceRecord[]
+  leads           ExternalLead[]
+  changes         UploadChange[]
+  errors          ImportError[]
+
+  @@index([session_id, type])
+  @@index([created_at])
+}
+
+model UploadChange {
+  id                  String       @id @default(uuid())
+  batch_id            String
+  entity_type         String       // "Enrollment", "ExamResult", "AttendanceRecord", "ExternalLead"
+  entity_id           String
+  action              String       // "INSERT", "UPDATE"
+  previous_data_json  Json?
+  created_at          DateTime     @default(now())
+
+  batch               UploadBatch  @relation(fields: [batch_id], references: [id], onDelete: Cascade)
+
+  @@index([batch_id])
+  @@index([entity_id])
+}
+
+model ImportTemplate {
+  id                String       @id @default(uuid())
+  type              UploadBatchType
+  name              String
+  header_signature  String       // Hash of header row
+  column_map        Json         // JSON map of Excel Header -> DB Field
+  options           Json?
+  created_by        String
+  created_at        DateTime     @default(now())
+
+  creator           User         @relation(fields: [created_by], references: [id])
+  batches           UploadBatch[]
+
+  @@index([header_signature])
+}
+
+model ImportError {
+  id          String               @id @default(uuid())
+  batch_id    String
+  row_no      Int
+  category    ImportErrorCategory
+  reason      String
+  raw_row     Json
+  created_at  DateTime             @default(now())
+
+  batch       UploadBatch          @relation(fields: [batch_id], references: [id], onDelete: Cascade)
+
+  @@index([batch_id])
+}
+
+model PossibleMatch {
+  id                    String         @id @default(uuid())
+  enrollment_id         String
+  candidate_profile_id  String
+  reason                String
+  status                MatchStatus    @default(PENDING)
+  resolved_by           String?
+  resolved_at           DateTime?
+  created_at            DateTime       @default(now())
+
+  enrollment            Enrollment     @relation(fields: [enrollment_id], references: [id], onDelete: Cascade)
+  candidate_profile     StudentProfile @relation(fields: [candidate_profile_id], references: [id], onDelete: Cascade)
+
+  @@index([status])
+}
+
+// ----------------------------------------------------------------------------
+// 6. CAMPAIGNS & CALL ALLOCATION (Section 10)
+// ----------------------------------------------------------------------------
+model Campaign {
+  id              String           @id @default(uuid())
+  name            String
+  purpose         String           // PTM, Marks, IOQM, Admission Follow-up, Fee, Routine, Other
+  session_id      String
+  assignment_date DateTime
+  due_date        DateTime?
+  outcome_options Json             // e.g. ["Will Attend", "Cannot Attend", "Maybe"]
+  status          String           @default("ACTIVE") // ACTIVE, ARCHIVED, DELETED
+  created_at      DateTime         @default(now())
+  updated_at      DateTime         @updatedAt
+
+  session         AcademicSession  @relation(fields: [session_id], references: [id])
+  mentors         CampaignMentor[]
+  call_tasks      CallTask[]
+  call_logs       CallLog[]
+
+  @@index([session_id, status])
+}
+
+model CampaignMentor {
+  id          String   @id @default(uuid())
+  campaign_id String
+  mentor_id   String
+
+  campaign    Campaign @relation(fields: [campaign_id], references: [id], onDelete: Cascade)
+  mentor      User     @relation(fields: [mentor_id], references: [id], onDelete: Cascade)
+
+  @@unique([campaign_id, mentor_id])
+}
+
+model CallTask {
+  id            String          @id @default(uuid())
+  campaign_id   String
+  enrollment_id String?
+  lead_id       String?
+  mentor_id     String
+  session_id    String
+  assigned_date DateTime        @default(now())
+  status        TaskStatus      @default(ASSIGNED)
+  assigned_by   String
+  completed_at  DateTime?
+  created_at    DateTime        @default(now())
+
+  campaign      Campaign        @relation(fields: [campaign_id], references: [id], onDelete: Cascade)
+  enrollment    Enrollment?     @relation(fields: [enrollment_id], references: [id], onDelete: Cascade)
+  lead          ExternalLead?   @relation(fields: [lead_id], references: [id], onDelete: Cascade)
+  mentor        User            @relation("MentorTasks", fields: [mentor_id], references: [id], onDelete: Cascade)
+  session       AcademicSession @relation(fields: [session_id], references: [id])
+
+  call_logs     CallLog[]
+
+  @@index([mentor_id, status, assigned_date])
+  @@index([enrollment_id])
+  @@index([lead_id])
+}
+
+// ----------------------------------------------------------------------------
+// 7. CALLING ENGINE & SINGLE DAILY LOG (Section 9.3)
+// ----------------------------------------------------------------------------
+model CallLog {
+  id                       String          @id @default(uuid())
+  task_id                  String?
+  enrollment_id            String?
+  lead_id                  String?
+  mentor_id                String
+  session_id               String
+  call_date                String          // IST date "YYYY-MM-DD" set strictly by server
+  disposition              CallDisposition
+  campaign_outcome         String?
+  first_initiated_at       DateTime        // Server-stored start time
+  last_submitted_at        DateTime
+  status                   String          @default("SUBMITTED") // OPEN, SUBMITTED, ABANDONED
+  latency_seconds          Int             @default(0)
+  is_suspicious_submission Boolean         @default(false)
+  idempotency_key          String?         @unique
+
+  task                     CallTask?       @relation(fields: [task_id], references: [id], onDelete: SetNull)
+  enrollment               Enrollment?     @relation(fields: [enrollment_id], references: [id], onDelete: Cascade)
+  lead                     ExternalLead?   @relation(fields: [lead_id], references: [id], onDelete: Cascade)
+  mentor                   User            @relation("MentorLogs", fields: [mentor_id], references: [id], onDelete: Cascade)
+  session                  AcademicSession @relation(fields: [session_id], references: [id])
+  campaign                 Campaign?       @relation(fields: [campaign_id], references: [id], onDelete: SetNull)
+  campaign_id              String?
+
+  attempts                 CallAttempt[]
+  activities               CallActivity[]
+  reminders                Reminder[]
+
+  // Database unique constraint: Exactly ONE CallLog per mentor per student per IST day
+  @@unique([mentor_id, enrollment_id, call_date], name: "uq_daily_mentor_student_call")
+  @@index([mentor_id, call_date])
+  @@index([enrollment_id])
+}
+
+model CallAttempt {
+  id               String       @id @default(uuid())
+  call_log_id      String
+  contact_used     ContactType
+  started_at       DateTime     @default(now()) // Server clock
+  duration_seconds Int          @default(0)
+
+  call_log         CallLog      @relation(fields: [call_log_id], references: [id], onDelete: Cascade)
+
+  @@index([call_log_id])
+}
+
+// Append-only chronological activity log (Section 9.5)
+model CallActivity {
+  id                String           @id @default(uuid())
+  call_log_id       String
+  type              CallActivityType
+  disposition_after CallDisposition
+  remark_text       String           @db.Text
+  reminder_after    DateTime?
+  by_user           String
+  created_at        DateTime         @default(now())
+
+  call_log          CallLog          @relation(fields: [call_log_id], references: [id], onDelete: Cascade)
+  user              User             @relation(fields: [by_user], references: [id])
+
+  @@index([call_log_id])
+}
+
+model Reminder {
+  id            String         @id @default(uuid())
+  mentor_id     String
+  enrollment_id String?
+  lead_id       String?
+  call_log_id   String?
+  remind_at     DateTime       // UTC stored, IST evaluated
+  status        ReminderStatus @default(PENDING)
+  created_at    DateTime       @default(now())
+
+  mentor        User           @relation(fields: [mentor_id], references: [id], onDelete: Cascade)
+  enrollment    Enrollment?    @relation(fields: [enrollment_id], references: [id], onDelete: Cascade)
+  call_log      CallLog?       @relation(fields: [call_log_id], references: [id], onDelete: SetNull)
+
+  @@index([mentor_id, status, remind_at])
+}
+
+// ----------------------------------------------------------------------------
+// 8. ACADEMIC MARKS & ATTENDANCE (Section 7.3 & 7.4)
+// ----------------------------------------------------------------------------
+model ExamResult {
+  id              String       @id @default(uuid())
+  enrollment_id   String
+  exam_name       String
+  exam_date       DateTime
+  subject_marks   Json         // Dynamic subjects e.g. {"Physics": 85, "Math": 92}
+  total           Float
+  max_total       Float        @default(300)
+  rank            Int?
+  percentage      Float
+  extra_json      Json?
+  upload_batch_id String?
+  created_at      DateTime     @default(now())
+  deleted_at      DateTime?
+
+  enrollment      Enrollment   @relation(fields: [enrollment_id], references: [id], onDelete: Cascade)
+  upload_batch    UploadBatch? @relation(fields: [upload_batch_id], references: [id], onDelete: SetNull)
+
+  @@unique([enrollment_id, exam_name, exam_date], name: "uq_student_exam_date")
+  @@index([enrollment_id, exam_date])
+}
+
+model AttendanceRecord {
+  id              String           @id @default(uuid())
+  enrollment_id   String
+  class_date      DateTime
+  time_slot       String           @default("") // e.g. "09:00-10:30"
+  subject         String
+  status          AttendanceStatus // P, A, L
+  upload_batch_id String?
+  created_at      DateTime         @default(now())
+  deleted_at      DateTime?
+
+  enrollment      Enrollment       @relation(fields: [enrollment_id], references: [id], onDelete: Cascade)
+  upload_batch    UploadBatch?     @relation(fields: [upload_batch_id], references: [id], onDelete: SetNull)
+
+  @@unique([enrollment_id, class_date, time_slot, subject], name: "uq_student_class_slot_subject")
+  @@index([enrollment_id, class_date])
+  @@index([subject])
+}
+
+model AttendanceSummary {
+  id            String     @id @default(uuid())
+  enrollment_id String
+  subject       String     // "__ALL__" for overall aggregate
+  present       Int        @default(0)
+  absent        Int        @default(0)
+  leave         Int        @default(0)
+  recorded      Int        @default(0)
+  percentage    Float      @default(0)
+  updated_at    DateTime   @updatedAt
+
+  enrollment    Enrollment @relation(fields: [enrollment_id], references: [id], onDelete: Cascade)
+
+  @@unique([enrollment_id, subject])
+}
+
+// ----------------------------------------------------------------------------
+// 9. EXTERNAL PROMOTIONAL LEADS (Section 7.5)
+// ----------------------------------------------------------------------------
+model ExternalLead {
+  id                 String       @id @default(uuid())
+  name               String
+  mobile             String       // Normalized
+  alternate_mobile   String?
+  city_school        String?
+  source_remarks     String?
+  extra_json         Json?
+  possible_duplicate Boolean      @default(false)
+  upload_batch_id    String?
+  created_at         DateTime     @default(now())
+  deleted_at         DateTime?
+
+  upload_batch       UploadBatch? @relation(fields: [upload_batch_id], references: [id], onDelete: SetNull)
+
+  call_tasks         CallTask[]
+  call_logs          CallLog[]
+
+  @@index([mobile])
+}
+
+// ----------------------------------------------------------------------------
+// 10. SYSTEM AUDITING & CONFIGURATION (Section 12)
+// ----------------------------------------------------------------------------
+model AuditLog {
+  id          String   @id @default(uuid())
+  user_id     String?
+  action      String   // LOGIN, UNMASK, EXPORT, UPLOAD, ROLLBACK, DELETE, ASSIGNMENT, SETTINGS
+  entity      String
+  entity_id   String
+  meta        Json?
+  ip          String?
+  created_at  DateTime @default(now())
+
+  user        User?    @relation(fields: [user_id], references: [id], onDelete: SetNull)
+
+  @@index([created_at])
+  @@index([action])
+}
+
+model Settings {
+  id                    String              @id @default("global")
+  pending_after_days    Int                 @default(2)
+  suspicious_seconds    Int                 @default(15)
+  attendance_leave_rule AttendanceLeaveRule @default(EXCLUDE)
+  dial_prefix           String              @default("+91")
+  monthly_call_days     Int                 @default(30)
+  updated_at            DateTime            @updatedAt
+}

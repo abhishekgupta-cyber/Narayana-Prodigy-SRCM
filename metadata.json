@@ -1,0 +1,7 @@
+{
+  "name": "Narayana Prodigy Student Relation Call Management CRM",
+  "description": "Production-grade spreadsheet-speed CRM for Narayana Prodigy with strict RBAC, anti-cheat call auditing, Excel batch ingestion, deduplication bucket, and real-time analytics.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+

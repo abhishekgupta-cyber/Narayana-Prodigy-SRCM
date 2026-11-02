@@ -1,0 +1,240 @@
+ROLE: Act as a Principal Full-Stack Architect, Senior Database Engineer, Security Engineer and UI/UX Lead.
+
+PRODUCT: "Narayana Prodigy Student Relation Call Management CRM" - a production-ready web app that feels as simple and fast as a Google Sheet, with login-based role access, strict data isolation, automatic mapping of uploaded Excel data to students, and a full calling / reminder / audit system. Users: Admin team + 20-30 mentors (staff) working at the same time; tens of thousands of students.
+
+PRIORITY ORDER if anything conflicts: (1) data correctness, (2) security/privacy, (3) simplicity for ordinary office staff, (4) speed, (5) looks.
+Do NOT add features that are not listed. No charts, no "login as mentor/impersonation", no gamification.
+
+=====================================================
+0. HOW YOU MUST WORK
+=====================================================
+0.1 Every point is mandatory. No mock data, placeholders, TODOs, hardcoded caps, or buttons that do nothing. A feature is "done" only when DB + API + UI work and its test passes.
+0.2 EXISTING PROJECT MODE: if an existing project is available, do Phase 0 first: audit frontend, APIs, auth, Prisma schema, imports, calling, reports; list the ROOT CAUSE of every bug in section 17; then refactor in place (no duplicate modules). Keep Next.js/Prisma/PostgreSQL if already used. Otherwise use the stack in section 2 and write a dry-run-capable migration script. NEVER reset or drop the database. Preserve all valid students, mentors, call logs and old remarks (old remarks move into history tables, visible to admin only). Never delete anything automatically: suspected demo/test/seed rows are only listed in a one-time admin-approved "Legacy Cleanup" screen (soft delete, auto-hides when empty). If there is no existing project, build from scratch.
+0.3 If the output limit is reached, stop at a clean file boundary and wait for me to say CONTINUE; never silently change earlier decisions. After each build phase (section 15) run build + tests and report REAL results. Never claim success for anything you did not run.
+0.4 If something is ambiguous, use section 1. If still unclear, choose the safer/simpler option and list it under "Assumptions" in the README. Do not stop to ask.
+0.5 Synthetic/test data is allowed ONLY in automated tests on a separate database. Production seed = exactly ONE admin user (password from env SEED_ADMIN_PASSWORD, forced change at first login, never printed or shown anywhere).
+
+=====================================================
+1. FINAL DECISIONS (these resolve every conflict)
+=====================================================
+D1 admission_no is unique across ALL sessions (among non-deleted rows). The same admission_no in an upload = UPDATE, never a second row. If it exists under a different academic session, do not overwrite: put the row in an admin "Admission No Clash" list.
+D2 One person = StudentProfile; each admission = Enrollment (1 profile -> many enrollments). Same Student Name + Father Name + Mobile with a different admission_no is a VALID cross-batch enrollment, never an error or "duplicate".
+D3 "Batch": the 22-field list has no Batch field. batch_name comes from the column mapped to Batch in the template (default: Course Name). Optional extra mapping "Admission Date"; if not mapped, admission-date reports use the upload date.
+D4 Phones: store a normalized 10-digit number (strip spaces, symbols, +91, leading 0). Fewer than 10 digits = row imported with a warning and no auto-linking. Dial link uses a configurable prefix (default +91).
+D5 Time: store UTC, display IST (Asia/Kolkata) as "02 Nov 2026, 04:30 PM". "Day" always means the IST day. Use one helper istDay(); never use server-local time.
+D6 Task states: ASSIGNED (not attempted), ATTEMPTED (called but not completed), COMPLETED (disposition Connected or Wrong Number), CANCELLED. Busy / No Answer / Switched Off / Not Reachable / Callback Requested = ATTEMPTED (retry needed).
+D7 Age rules are in DAYS: a task is "New" if assigned_date is within the last N IST days (admin setting pending_after_days, default 2 = 48h); older and unattempted = "Pending" with an Overdue badge. Passing due_date also marks Overdue. Assignment date may be today or earlier, never future. Status is computed on read, never by a browser timer.
+D8 Each task/reminder appears in exactly ONE mentor bucket at a time (9.4). No duplicate rows anywhere.
+D9 Same-day edit window = until 11:59:59 PM IST of the call's day, judged by the server clock.
+D10 Monthly relationship call: a qualifying call = disposition Connected. A student is "Monthly Call Due" if (last_connected_at, else enrollment created date) is older than 30 days (setting).
+D11 Attendance % = Present / (Present + Absent) x 100. Leave is shown separately (setting: exclude [default] / count as absent / count as present). A BLANK cell = "not recorded", never Absent.
+D12 Results/attendance are matched by Admission No. Optional fallback: admin maps student mobile, and a row attaches ONLY if it matches EXACTLY ONE enrollment; zero or several matches go to the Unmatched/Ambiguous report. Never guess.
+D13 Roles: ADMIN and MENTOR only. Mentors cannot export, upload, or see admin screens.
+D14 Counts: Total Admissions (= Course Seats) = number of enrollments; Unique Students = distinct profiles; Cross-Batch Students = profiles with 2+ enrollments; Single-Course Students = profiles with exactly 1. Example: 150 students x 3 courses + 25 students x 2 courses = Unique 175, Seats 500, Cross-Batch 175. Respect the selected session, with an "All sessions" toggle.
+
+=====================================================
+2. STACK
+=====================================================
+Next.js (App Router, TypeScript), Tailwind, TanStack Table (server-side mode), PostgreSQL + Prisma (use raw SQL migrations for partial unique indexes, CHECK constraints, pg_trgm), cookie sessions (httpOnly, Secure, SameSite=Lax, server-validated) + bcrypt cost 12, origin/CSRF check on every mutating route, zod validation on every API input, SheetJS + PapaParse for parsing, exceljs (streaming) for exports, pg-boss for background jobs, structured logging. One database, no microservices.
+
+=====================================================
+3. DATA MODEL (all with proper FKs, indexes, deleted_at where noted)
+=====================================================
+User: full_name, designation (free text), mobile (unique), username (unique), email, password_hash, role, status ACTIVE/INACTIVE, must_change_password, failed_logins, locked_until.
+AcademicSession: name (2025-26, 2026-27, 2027-28; admin can add), start_month (default 4), is_active.
+StudentProfile: student_name, father_name, mother_name, primary_mobile, alternate_mobile, email, gender, dob, govt_id (ENCRYPTED, admin sees last 4 only, never in mentor APIs), address, city, state, district, pin, person_key (lower/trim/collapse-space name | father | last-10-digits mobile).
+Enrollment: admission_no (unique where deleted_at is null), profile_id, academic_session_id, course_name, course_type, course_group, course_class, course_category, batch_name, mentor_id (nullable), raw_mentor_name, admission_date (nullable), last_connected_at, last_call_at, latest_result_summary (json), upload_batch_id, deleted_at/by.
+UploadBatch: type, session, template_id, file_name, uploaded_by, status/progress, row counts. UploadChange: per-row inserted id or previous values (enables rollback).
+ImportTemplate: type, name, header_signature, column_map (json), options (json), created_by. ImportError: batch_id, row_no, category (INVALID/UNMATCHED/AMBIGUOUS/CLASH), reason, raw row json.
+PossibleMatch: enrollment_id, candidate_profile_id, reason, status PENDING/MERGED/DISMISSED.
+Campaign: name, purpose, session, assignment_date, due_date, outcome_options (json), status ACTIVE/ARCHIVED/DELETED(soft). CampaignMentor (target mentors).
+CallTask: campaign_id, enrollment_id XOR lead_id (CHECK), mentor_id, assigned_date, status, assigned_by, completed_at. Constraints: unique(campaign_id, enrollment_id/lead_id); only ONE active (ASSIGNED/ATTEMPTED) task per enrollment or lead.
+CallLog: task_id (nullable), enrollment_id XOR lead_id, mentor_id, call_date (IST date, set by server), disposition, campaign_outcome, first_initiated_at, last_submitted_at, status OPEN/SUBMITTED/ABANDONED, latency_seconds, is_suspicious_submission, idempotency_key (unique). UNIQUE(mentor_id, target, call_date): ONE CallLog per mentor per student/lead per IST day, enforced by the database.
+CallAttempt: call_log_id, contact_used PRIMARY/ALTERNATE, started_at (server), duration.
+CallActivity (append-only, never updated or deleted): call_log_id, type INITIAL_SUBMIT / INBOUND_UPDATE / ATTEMPT_ADDED / REMINDER_CHANGED, disposition_after, remark_text, reminder_after, by_user, created_at. Remark text lives ONLY here.
+Reminder: mentor_id, enrollment_id/lead_id, call_log_id, remind_at, status PENDING/DONE/CLEARED.
+ExamResult: enrollment_id, exam_name, exam_date, subject_marks (json, dynamic subjects), total, max_total, rank, percentage, extra json, upload_batch_id, deleted_at. UNIQUE(enrollment_id, exam_name, exam_date).
+AttendanceRecord: enrollment_id, class_date, time_slot (empty string if none), subject, status P/A/L, upload_batch_id, deleted_at. UNIQUE(enrollment_id, class_date, time_slot, subject).
+AttendanceSummary: enrollment_id, subject ("__ALL__" for overall), present, absent, leave, recorded, percentage.
+ExternalLead: name, mobile, alternate_mobile, city_school, source_remarks, extra (json, all other columns), possible_duplicate flag, upload_batch_id, deleted_at.
+AuditLog: user, action, entity, entity_id, meta, ip, time. Logs logins, unmasks, exports, uploads, rollbacks, deletes, assignments, merges, password resets, settings changes.
+Settings: pending_after_days=2, suspicious_seconds=15 (hidden from all UI except admin Settings), attendance_leave_rule, dial_prefix, monthly_call_days=30.
+academic_session_id is on every Enrollment, Campaign, CallTask, CallLog, ExamResult, AttendanceRecord, ExternalLead, UploadBatch (denormalize where derived, for fast filtering).
+
+Indexes (mandatory): enrollment(admission_no), (profile_id), (mentor_id, session), (session, batch_name), (session, course_name); pg_trgm GIN on student_name and father_name; mobile prefix/exact; CallTask(mentor_id, status, assigned_date); CallLog(mentor_id, call_date), (enrollment_id); Reminder(mentor_id, status, remind_at); ExamResult(enrollment_id, exam_date desc); AuditLog(created_at).
+
+=====================================================
+4. LANDING, LOGIN, USERS
+=====================================================
+4.1 Landing page = ONLY: Narayana Prodigy branding, Username/Mobile, Password (show/hide eye), Login. No counts, charts, mentor lists, default/demo passwords, helper text. No data fetched before login. All data APIs require auth (middleware). Generic error text (do not reveal whether the username exists). Rate limit per IP and per account; lock for 15 minutes after 5 failures. noindex.
+4.2 Mentors & Users (admin): Add/Edit with Full Name, Designation (free text with suggestions: Senior Academic Mentor, Student Relation Officer, Faculty, Academic Coordinator), Mobile, Username/Email, Role, Password. Admin can set or reset any password anytime (optional "must change on first login"). Passwords are bcrypt-hashed and NEVER displayed. Deactivate instead of delete (history preserved). Students of a deactivated mentor appear in a "Needs new mentor" filter.
+
+=====================================================
+5. ACADEMIC SESSION (GLOBAL)
+=====================================================
+A session selector sits in the header for both roles and is remembered. Every screen, count, assignment, export and report shows ONLY the selected session (Reports also offer "All Sessions"). Uploading requires choosing a session first. Sessions never mix, and an admission in another session never overwrites an older one.
+
+=====================================================
+6. NAVIGATION (ONE hamburger menu per role, no duplicate tabs)
+=====================================================
+ADMIN header: hamburger | logo | session selector | name | logout.
+Menu: 1 Dashboard, 2 Student Directory, 3 Upload Center, 4 Campaigns & Call Assignment, 5 Cross-Batch Enrollees, 6 External Leads, 7 Mentors & Settings, 8 Reports & Call Audit. Selecting an item shows only that module.
+- Dashboard: small real-data KPI strip (Total Admissions, Unique Students, Assigned Calls, Completed, Pending, Active Mentors) + a mentor table: Mentor | Designation | Total Assigned | New | Completed | Pending/Overdue | Reminders Due | Monthly Call Overdue. Click a row = that mentor's tracking page. Small notices: Unmapped Mentors, Possible Matches to review, Unmatched upload rows. Admin never needs to log in as a mentor.
+- Student Directory: server-paginated grid of enrollments (Student, Father, Admission No, Session, Course, Batch, Mentor, Attendance %, Latest Result) with filters (Batch, Course, Mentor, Name, Father, Admission No, Mobile, Upload date). Row click = student page: all enrollments, full attendance and results, full call timeline with every remark. Bulk actions on selection (same selection component as 10.3): Assign to Campaign, Change Mentor, Delete.
+- Mentors & Settings: users (4.2), sessions, thresholds, attendance leave rule, Unmapped Mentors list (admin picks the right mentor, then re-link), audit log viewer.
+
+MENTOR header: hamburger | session selector | name | logout. Home shows 3 KPI cards from real data: (1) New Assigned Calls, (2) Pending/Overdue Calls, (3) Reminders Due (with "+ N monthly calls due" inside the card). Each card opens the matching list.
+Menu: Assigned Calls | My Students | Call History. Mentors have no access to uploads, settings, other mentors' data, or any admin API.
+
+=====================================================
+7. UPLOAD CENTER (admin only)
+=====================================================
+Four cards: Master Admissions, Exam Results, Attendance, External Leads. Every card: choose session, "Download Sample Excel", drag-drop (xlsx/xls/csv), PREVIEW before saving (rows OK / new / updated / unmatched / errors with reasons, downloadable error file), Confirm. Large files run as background jobs with a progress bar (no timeouts). Never silently skip a row. Every upload creates an UploadBatch; every row stores upload_batch_id. Upload History lists batches with one-click Rollback (7.6).
+
+7.1 TEMPLATE MANAGER: admin uploads his OWN sample sheet for Admissions, Results or Attendance; the system reads headers; admin maps each column to a system field once (and picks Admission No column, required columns, Batch column); saves as a named template (e.g. "JEE Unit Test"). Later files with matching headers map automatically; if headers changed, show the mapping screen again instead of failing. Built-in default templates (the sample Excel files) work from day one. Subjects are NEVER hardcoded: any subject column is read dynamically.
+
+7.2 MASTER ADMISSIONS: the 22 fields: Admission No, Academic Year, Student Name, Father Name, Mother Name, Student Mobile, WhatsApp/Alternate Mobile, Email, Gender, DOB, Govt ID, Address, City, State, District, Pin, Course Name, Course Type, Course Group, Course Class, Mentor, Course Category (+ Session chosen on the card, optional Admission Date). Upsert by admission_no: update only non-empty mapped fields, never blank out existing data, never touch call history. The Mentor column is matched to a mentor user (normalized name/username) and sets owner_mentor; unmatched names are kept in raw_mentor_name and listed under "Unmapped Mentors" (never dropped). Identity linking follows section 8.
+
+7.3 EXAM RESULTS: default columns [Admission No, Exam Name, Exam Date, <any subject columns>, Total, Max Marks, Rank/Percentage]. Match per D12. Upsert on (enrollment, exam name, exam date); older exams are always retained. Update latest_result_summary on the enrollment. Student view shows exam name, date, subject-wise marks, total, max, rank/percentage. Unmatched/ambiguous rows -> report with reasons.
+
+7.4 ATTENDANCE (date-wise, time-slot-wise, subject-wise). Auto-detect and support:
+ A) MATRIX (recommended, like the Google Sheet): [Admission No, (Student Name optional), Subject, then one column per class]. Class column header = "DD-MM-YYYY|HH:MM-HH:MM" (slot optional, e.g. "05-Nov-2026|09:00-10:30").
+ B) COMBINED HEADER: [Admission No, "01-Nov Physics", "01-Nov Chemistry", "02-Nov Math", ...] where the template defines how date / subject / slot are read from the header.
+ C) FLAT: [Admission No, Date, Time Slot, Subject, Status].
+ Cells P / A / L (also Present/Absent/Leave, any case). Dates are parsed day-first (DD-MM-YYYY, DD/MM/YYYY, "5 Nov 2026", Excel date serials). If a header has no year, infer it from the selected session (month >= session start month = start year, otherwise end year) and show the result in the preview. If the format is ambiguous, show a mapping preview instead of guessing. BLANK = not recorded.
+ Upsert on (enrollment, date, slot, subject): re-uploading the same weekly sheet never duplicates; later weeks only add/update their dates; the older history is never replaced. After each upload, recompute AttendanceSummary (COUNTIF-style present/absent/leave/recorded/% per subject + overall) ONLY for the affected enrollments, inside the same transaction.
+ Student card: overall % + Present/Absent/Leave totals, subject-wise table ("Physics: 18/20 present"), expandable date-wise list (date, slot, subject, status) and an Absent/Leave list, with optional from/to date filter.
+
+7.5 EXTERNAL LEADS (no fixed format): any columns accepted. Admin maps whichever columns hold Name / Mobile / Alternate / City-School / Remarks; all other columns go to a JSON field. At least one mobile column required. Full search (name, mobile, school/city, any text), upload-date filter, pagination, bulk select (10.3), assignment to mentors, single and bulk delete, call history, Excel export. Duplicate mobiles are only FLAGGED, never deleted. Leads are never treated as admissions and are never mixed into the Student Directory.
+
+7.6 DELETE & ROLLBACK (admin only): single-row delete (student/enrollment, lead, result, attendance row, assignment) with a confirmation modal. Bulk delete: filter by session + type + upload batch/date, preview "N rows will be deleted (X have call history)", type DELETE to confirm. All deletes are soft (deleted_at/by) with an AuditLog entry; permanent purge is a separate admin-only action. Rollback of an upload reverses inserts (soft delete) and restores previous values of updated rows; rows that already have call history/assignments are kept and listed as "not rolled back". Never delete a whole StudentProfile because one enrollment is wrong. Recompute summaries after any delete/rollback.
+
+=====================================================
+8. STUDENT IDENTITY & CROSS-BATCH ENROLLEES
+=====================================================
+On every admission row: (1) existing admission_no -> update (D1). (2) New admission_no -> compute person_key; exact match -> attach to that StudentProfile as a new Enrollment (no error). (3) Near-match (same last-10 mobile but slightly different name/father spelling, or exact name+father with missing mobile) -> create separately and add to "Possible Matches" (admin review: Merge / Not the same; merge relinks enrollments and is audit-logged; never auto-merge).
+Cross-Batch Enrollees (admin) with 3 tabs: Cross-Batch Students (2+), Single-Course Students, Needs Review (Possible Matches + Admission No Clash).
+- KPI cards: Unique Students, Total Course Seats, with 2 courses, with 3 courses, 4+, only 1 course.
+- Cross-batch grid: Student Name, Father Name, Mobile, No. of Courses, and EVERY Admission No with its Course/Batch and Session. Filters: Double / Triple / 4+. Instant server-side search by Student Name, Father Name, Mobile, Admission No.
+- Excel (1 click): Sheet1 Summary, Sheet2 cross-batch students (one row per student), Sheet3 flat list of all their admissions; plus a separate download of the single-course list.
+- All overall student counts everywhere show "Unique Students" and "Total Admissions" separately.
+
+=====================================================
+9. MENTOR WORKSPACE AND CALLING ENGINE
+=====================================================
+9.1 NUMBER MASKING (all devices): phones are masked (XXXXXX4521) for non-admin users on desktop, laptop and mobile, in the UI AND in every API response (server-side; CSS hiding is not enough). The real number is returned ONLY by POST /api/call-sessions/start, after the server confirms the target is assigned to this mentor (task.mentor_id = me, or enrollment.mentor_id = me) and writes an UNMASK audit log. Responses are Cache-Control: no-store. The number is cleared from client state when the popup closes. Admin screens show full numbers. Mentor APIs return only needed fields (no Govt ID, address, email, DOB).
+
+9.2 CALL BUTTONS: each row shows masked Primary and Alternate/WhatsApp numbers, each with its own "Call" button (hide a button if that number is missing). If one number fails, the mentor tries the other.
+Click flow: disable the button while the request runs (debounce) -> POST start with an idempotency key -> Call Popup opens with: student card (9.10), full number in large text, a "Dial now" tel:<prefix+number> button, neutral live timer, Disposition, Campaign Outcome (when the call belongs to a campaign), Remark (ALWAYS EMPTY on open), optional Reminder date + time, Submit. On mobile, also open the native dialer (tel:) as soon as the response arrives, and keep the popup so the mentor can return and enter the remark; the "Dial now" button is the fallback if the browser blocks auto-dial. Desktop/laptop: show the number for desk-phone dialing, no auto-dial.
+Dispositions: Connected, Busy, No Answer, Switched Off, Not Reachable, Wrong Number, Callback Requested.
+
+9.3 TIMER AND NO DUPLICATES: first_initiated_at is stored on the SERVER; the API returns server time so the timer never depends on the browser clock. Refreshing or reopening resumes the same timer. Clicking Call while a session is OPEN resumes it and never restarts. Using the other number or an explicit "Log Another Attempt" adds a CallAttempt inside the SAME CallLog (that attempt gets its own timer). A student called twice in one day = ONE row (database unique key) with 2 attempts. Reports show both "Calls" and "Attempts". An OPEN session that was never submitted is marked ABANDONED at midnight IST and shown to admin as "unsubmitted session"; it does not count as a call.
+
+9.4 ASSIGNED CALLS (one list, filter chips; each task in exactly one chip; precedence top to bottom):
+ - Called Today: any task/student with a CallLog today (all dispositions). Shows disposition, time, and TODAY'S OWN remark, with buttons "Update Today's Call" and "Log Another Attempt". It does NOT vanish after submit.
+ - Reminders Due: PENDING reminder with remind_at <= now (stays visible, with its date, even if days late).
+ - Pending: ASSIGNED and older than the threshold (Overdue badge), or ATTEMPTED on an earlier day with no future reminder (Retry badge).
+ - New: ASSIGNED, within the threshold.
+ Columns: Assigned Date, Campaign Purpose, Student, Batch, masked contacts, Status, Call buttons. After midnight a COMPLETED task leaves this list and goes to Call History (full detail stays with admin). A task with a future reminder is hidden until the reminder is due. Pending calls stay with the mentor. Assigned external leads appear here too, tagged "Lead" (name, city/school, and the lead's "note from sheet").
+
+9.5 UPDATE TODAY'S CALL (parent calls back): available until 11:59:59 PM IST of the call's day. The mentor can change the disposition (e.g. No Answer -> Connected), ADD a new timestamped remark, change or clear the reminder, set the outcome. It edits the SAME CallLog, creates no new row, and starts no timer unless "Log Another Attempt" is chosen. Nothing is overwritten: every change is appended to CallActivity, so admin sees the original attempt, original disposition and remark, the callback update, new disposition, new remark and exact timestamps. Task status is recalculated. After midnight the API rejects edits and the UI hides the button permanently; if a reminder was set, the student returns on that date and a fresh call is logged then.
+
+9.6 REMARK PRIVACY (enforced in a DTO/query layer for every mentor endpoint, with tests): a mentor receives remark text only if it was written by THEM and TODAY (IST). No "remark" column exists in any mentor list. Never any remark from earlier days, other mentors, or admin. The new-call form is always empty; the update form shows today's earlier notes read-only plus an empty box for a new remark. Admin sees the complete chronological history.
+
+9.7 STEALTH ANTI-CHEAT: mentors see only a neutral timer, no hint about timing anywhere. REMOVE completely every client message like "Anti-Cheat Alert / Suspicious Instant Submission". On server submit: if disposition = Connected and (submitted_at - latest attempt started_at) < suspicious_seconds (default 15, hidden setting), silently store latency_seconds and is_suspicious_submission = TRUE. No mentor-facing API response may contain latency or the flag. An INBOUND_UPDATE (no dialing) is not latency-checked; admin audit shows its "minutes after the original call". Flags appear only in admin audit screens and admin Excel exports. Note in the README: the timer measures time since dialer initiation, not verified phone conversation time.
+
+9.8 MY STUDENTS: only students whose Enrollment.mentor_id = me (matched from the upload's Mentor column), ALL of them, server-paginated with "Showing X-Y of TOTAL" (e.g. 120 students = all 120 across pages). Columns: Student, Batch, masked Primary + Alternate with Call buttons, attendance summary, latest result. NO assignment date and NO remarks here. A mentor may call anyone here voluntarily at any time (creates a CallLog without a task). Students with an ACTIVE task appear only in Assigned Calls; show "Total X students | Y currently in Assigned Calls". Filter chip "Monthly Call Due". After a task completes, the student shows here again.
+
+9.9 CALL HISTORY (mentor): own completed calls (date/time, student, batch, disposition), remarks only if written today. Reminder and history dates/times are fully visible, never clipped (D5 format; cards on mobile).
+
+9.10 STUDENT CARD (inside popup and student view, read-only): overall attendance %, subject-wise "Physics: 18/20 classes present", expandable Absent list (date, time slot, subject), latest exam result subject-wise with rank.
+
+9.11 MONTHLY RULE: every student owned by a mentor needs a Connected call at least every 30 days (D10). Overdue students appear for the mentor as "Monthly Call Due" (in Reminders Due and My Students) and are counted on the admin dashboard. Computed by an indexed query (no mass reminder rows). An unattempted assignment never counts as a relationship call.
+
+9.12 REMINDERS: optional date + time (time defaults to 10:00 AM). A new call to the same student marks earlier PENDING reminders DONE; changing a reminder in an update marks the old one CLEARED.
+
+=====================================================
+10. CAMPAIGNS, ASSIGNMENT, BULK SELECTION
+=====================================================
+10.1 Campaign fields (all mandatory unless noted): Name, Purpose (PTM / Marks / IOQM / Admission Follow-up / Fee / Routine / Other), Session, Assignment Date (date picker, default today), Due Date (optional), Target Mentor(s), Outcome Options (e.g. PTM: Will Attend / Will Not Attend / Maybe; Marks: Discussed / Needs Follow-up; IOQM: Interested / Not Interested / Registered). Admin can EDIT name/purpose/date/outcomes and ARCHIVE or DELETE (confirmation shows the number of affected tasks and calls; soft delete + audit; call history is kept).
+10.2 ASSIGNMENT: pick campaign (its purpose and date are shown) -> filter the list (Batch, Course, owner mentor, search, "Hide already assigned in this campaign") -> select -> choose mentor(s) -> preview -> confirm. The mentor sees the assignment date and campaign purpose.
+10.3 BULK SELECTION (ONE shared component used in Student Directory, Campaign Assignment and External Leads; no hardcoded 50 limit, no minimum): 
+ - Presets: Select All Matching, 10, 25, 50, 100, 250, 500.
+ - Index range text: "1-50", "60-90", "1-10, 15, 20-25" (positions refer to the FULL filtered + sorted list, not only the visible page; the grid shows a global "#" row number). Show live "N records selected". Invalid input shows an inline error.
+ - Exact count: "Assign exactly N calls" (N >= 1) from the top of the list.
+ - "Only unassigned" filter, "Assign next N unassigned", and "Split equally among selected mentors" (contiguous blocks; the first mentors take the remainder).
+ - Sorting is stable (explicit sort + id tie-break). Selection and assignment run on the SERVER from {filters, sort, selection spec}; never load tens of thousands of rows in the browser and never send huge id lists.
+ - Preview returns total N, a 5-row sample, and the number skipped because the student already has an active task; it stores a server-side snapshot token (valid 10 minutes). Confirm assigns EXACTLY that snapshot in one transaction. Confirmation summary shows campaign, date, mentor, count.
+ - Example that must work: give 1-50 to Mentor A, then 1-50 (with "only unassigned") to Mentor B gives different students; "exactly 1" and "exactly 5" work.
+
+=====================================================
+11. REPORTS AND TRACKING (admin only)
+=====================================================
+Every report has: session (or All Sessions), From and To date pickers (native date inputs, validated From <= To, inclusive IST day boundaries converted to UTC), presets Today / Yesterday / Last 7 / Last 30 / This month / Custom, an Apply button, searchable table, and 1-click Excel (exceljs, streamed). Custom dates MUST be selectable and work.
+A) ADMISSION REPORT (completely separate from calling): total admissions, unique students, batch-wise, course-wise, mentor-wise, date-wise (per D3).
+B) CALLING REPORT: filters session, campaign, mentor, batch, dates, disposition. Shows assigned, attempted, completed, pending, overdue, Connected / Busy / No Answer / Switched Off / Not Reachable / Wrong Number / Callback Requested; Calls and Attempts.
+C) MENTOR TRACKING (one-to-one): choose a mentor + date range: calls assigned (assignment date + campaign), completed, pending, new, overdue; EVERY call with exact date and time, student, admission no, batch, contact used, duration, disposition, outcome, all remarks in order, follow-up date; disposition breakdown; suspicious-submission count; unsubmitted sessions. Excel for one mentor or all (Summary sheet + Calls sheet).
+D) BATCH-WISE CALL AUDIT (IOQM case): choose a batch or campaign: every student INCLUDING those with 0 calls: number of calls, attempts, mentors who called, date-time of each call, every remark in order. Excel: sheet 1 = one row per student, sheet 2 = every call (long format).
+E) CAMPAIGN REPORT: pick a campaign (edit/delete available here too): total mentors, assigned, completed, pending, per-mentor split, disposition and outcome counts (PTM: Will Attend X / Not Y), student-level table. Excel with campaign details, student, mentor, assignment date, call date/time, disposition, outcome, remarks, attempts. Example: PTM, 4 mentors, 300 calls = one consolidated report.
+Admin exports include the suspicious flag and latency; mentors have no export access.
+
+=====================================================
+12. SECURITY
+=====================================================
+Real protection is server-side: role check on EVERY API and in every DB query filter, server-masked numbers, field whitelists, audit logs (views, unmasks, exports), rate limits, httpOnly cookies, CSRF/origin checks, security headers (CSP, X-Frame-Options, no-referrer), no stack traces to clients.
+Browser deterrents for NON-ADMIN only (admin is exempt): user-select:none, block right-click, block Ctrl+C/X/A/U/S/P, F12 and PrintScreen keys, @media print hides content, blur the screen when the tab/window loses focus, diagonal watermark on every data screen with Mentor Name + ID + live timestamp.
+README must state honestly: a browser cannot truly block OS-level screenshots or screen recording; these measures are deterrents plus traceability (a native app is needed for a hard block).
+
+=====================================================
+13. PERFORMANCE
+=====================================================
+Every list is server-paginated (25/50/100/200, default 50), searched (debounced 300 ms) and sorted server-side, always showing "Showing X-Y of TOTAL"; NO 50-record cap on total accessible data. Bulk imports use batched INSERT ... ON CONFLICT (1,000 rows per batch) in transactions; no N+1 queries; heavy stats are never computed on page load (attendance summaries precomputed at upload, last_connected_at stored on the row, Pending/Overdue via indexed queries). Must stay smooth with 30 simultaneous users and 50,000+ enrollments.
+
+=====================================================
+14. UI RULES (simple, like a Google Sheet)
+=====================================================
+Spreadsheet-style grids: sticky header, column search/filter, sortable, resizable columns, keyboard friendly. Big buttons, plain words, minimal colors, no animations. Responsive: on screens under 768 px mentor lists become cards. Date/time cells never clipped (no ellipsis; nowrap; auto width). Real empty states ("No records") and loading states; no fake counts. Buttons that cannot act are removed, not disabled-forever.
+
+=====================================================
+15. BUILD ORDER (report real test results after each phase)
+=====================================================
+P0 audit (if existing project) -> P1 schema, migrations, partial indexes, seed (admin only), auth, landing, users -> P2 sessions, shell, hamburger menus -> P3 upload framework (templates, preview, background jobs, errors, rollback) -> P4 admissions + identity + cross-batch -> P5 results + attendance + summaries -> P6 directory + mentor screens (masking DTOs, remark privacy) -> P7 calling engine (sessions, timer, update, locks, reminders, anti-cheat) -> P8 campaigns + bulk selection -> P9 external leads -> P10 reports + Excel -> P11 security hardening -> P12 tests, 50k-row performance test, production build, README (setup, env vars, security limitation, assumptions), QA checklist.
+
+=====================================================
+16. ACCEPTANCE TESTS (all must pass; write them as automated tests where possible)
+=====================================================
+T1 Landing page shows only the login card; no data requests before login.
+T2 No hardcoded demo users, no "Reset to 1548" button or endpoint (route does not exist); production seed = one admin.
+T3 Two sessions upload separately; the session switch changes every screen and report.
+T4 Admission 101/205/310 with same name+father+mobile = 1 profile, 3 enrollments, 0 duplicate admission_no, listed in Cross-Batch. The 150x3 + 25x2 example shows Unique 175 / Seats 500. Search and Excel work. Same admission_no re-upload updates, never duplicates.
+T5 A mentor with 120 students sees all 120 across pages; raw numbers never appear in any network response, DOM table, or export; only POST start returns a number, and an UNMASK is logged.
+T6 Mentor A cannot read Mentor B's students, tasks or numbers (direct API calls return 403/404).
+T7 Result upload by Admission No attaches automatically; old exams are retained; ambiguous/unmatched rows go to the report.
+T8 Attendance matrix and combined-header uploads (blank cells ignored, year inferred from the session) give correct per-subject present/total, % and absent dates; a second week keeps earlier dates; re-uploading the same sheet creates no duplicates.
+T9 Calling the same student twice in a day = ONE row with 2 attempts; the timer never restarts on re-click, refresh or reopen.
+T10 10:00 AM No Answer + reminder; 11:30 AM "Update Today's Call" -> Connected + new remark on the SAME record; original activity remains visible to admin; after 11:59:59 PM IST the update is rejected; the reminder brings the student back on its date.
+T11 A mentor never receives any remark from an earlier day or another mentor, sees no anti-cheat text anywhere (UI, API JSON, JS bundle), and a Connected call under 15 s is flagged only in admin audit.
+T12 Unattempted tasks older than the threshold show under Pending with an Overdue badge; a student with an active task appears only in Assigned Calls; a completed task leaves the active list after midnight; an attempted-not-connected task returns to Pending as Retry.
+T13 Monthly rule: a student with no Connected call for 30+ days appears as "Monthly Call Due" for the mentor and in the admin dashboard count.
+T14 Bulk: 1-50 to Mentor A, then 1-50 (only unassigned) to Mentor B = different students; "60-90", "1-10, 15, 20-25", exactly 5 and exactly 1 work; no overlap and nothing skipped; the preview snapshot equals what is assigned.
+T15 Campaign has date + outcomes; edit and delete work; the PTM campaign across 4 mentors gives one consolidated report with Excel.
+T16 Mentor Tracking and the IOQM Batch-Wise Call Audit Excel files are correct, including students with 0 calls.
+T17 Admin dashboard shows per-mentor assigned / pending / reminders / monthly overdue; Admission Report and Calling Report are separate; custom dates work.
+T18 External leads upload with arbitrary columns, search, flag duplicates, bulk-assign, call through the same popup, delete, and export; they never appear in the Student Directory.
+T19 Delete and rollback: a faulty upload is rolled back safely; students with call history are kept; soft delete and audit entries exist.
+T20 Admin creates a mentor with a designation and password (bcrypt, never shown); login lockout works; a deactivated user cannot log in.
+T21 50,000-enrollment performance test (separate DB): paginated lists, search and the dashboard respond fast.
+T22 Non-admin deterrents work (selection, right-click, shortcuts, blur, watermark, print); admin is exempt.
+T23 Production build succeeds with no critical API/DB errors.
+
+=====================================================
+17. KNOWN BUGS TO FIX AND PROVE FIXED (state the root cause of each)
+=====================================================
+B1 Mentor lists stop at 50 records. B2 "Reset to 1548" button/endpoint. B3 Landing page shows totals and default passwords. B4 My Queue / Due Today / Call History not working. B5 Reminder dates clipped. B6 Mentor cannot see own students properly. B7 Same student shows as two call rows and the timer restarts on re-click. B8 Anti-cheat alert visible to mentors. B9 Custom report dates cannot be selected. B10 Minimum 10 calls restriction. B11 Duplicate tabs/lists; old remarks visible to mentors. B12 Cross-batch students shown as duplicates. B13 Admin has no per-mentor call tracking or IOQM batch audit. B14 No date on assignment; no campaign edit/delete.
+
+=====================================================
+18. FINAL DELIVERABLES
+=====================================================
+1. Complete Prisma schema + SQL migrations (partial unique indexes, CHECKs, pg_trgm) + seed with only the admin. 2. All API routes with auth and role checks (imports preview + commit, template mapping, call-session start/submit/update/attempt, assignment preview + confirm, delete/bulk-delete/rollback, every Excel export). 3. Full Next.js UI: landing, admin, mentor, call popup, upload center, reports. 4. README: setup, env vars, security limitation, assumptions. 5. QA checklist containing only items you actually ran. 6. A "Spec Coverage Matrix" table mapping every section-1 decision, every B-bug and every T-test to the file(s) and test(s) that implement it, with PASS/FAIL, and an honest list of anything NOT verified. Do not claim success for untested functionality.
+
+FINAL PRIORITY: this must feel like a simple, fast, secure Google Sheet with calling and academic-data features, not complicated institutional software. Admin has complete control. Mentors see only their own students and calling work. Uploads are easy and automatic. Every call, remark, reminder and assignment is traceable by admin.
