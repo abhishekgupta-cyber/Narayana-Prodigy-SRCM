@@ -51,6 +51,7 @@ import {
 import { crmDb } from '../../services/db';
 import {
   exportFilteredDataToExcel,
+  exportCallingReportToExcel,
   exportCampaignReportToExcel,
   exportAdmissionConversionReportToExcel,
   exportAdmissionReportToExcel,
@@ -167,11 +168,18 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const [adminNotice, setAdminNotice] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [confirmRollbackBatchId, setConfirmRollbackBatchId] = useState<string | null>(null);
   const [confirmDeleteCampaignId, setConfirmDeleteCampaignId] = useState<string | null>(null);
+  const [persistenceMode, setPersistenceMode] = useState<string>('LOCAL_JSON');
 
   const showAdminNotice = (text: string, type: 'success' | 'error' = 'success') => {
     setAdminNotice({ text, type });
     setTimeout(() => setAdminNotice(null), 4500);
   };
+
+  useEffect(() => {
+    void crmDb.getServerHealth().then((h) => {
+      if (h?.persistenceMode) setPersistenceMode(h.persistenceMode);
+    });
+  }, [activeTab]);
 
   const refreshAll = () => {
     setAnalytics(crmDb.getAnalytics());
@@ -322,8 +330,132 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   };
 
   const mentorsList = crmDb.getMentors();
-  const allBatches = Array.from(new Set(students.map((s) => s.batch_name).filter(Boolean)));
-  const allCourses = Array.from(new Set(students.map((s) => s.course_name).filter(Boolean)));
+  const allBatches = crmDb.getDistinctBatches();
+  const allCourses = Array.from(new Set(crmDb.getAllStudents().map((s) => s.course_name).filter(Boolean)));
+
+  const handleExcelUpload = async (
+    type: 'ADMISSIONS' | 'EXAMS' | 'ATTENDANCE' | 'EXTERNAL_LEADS',
+    e: React.ChangeEvent<HTMLInputElement>
+  ) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+
+    try {
+      const activeSessionIdVal = crmDb.getActiveSession().id;
+      if (type === 'ADMISSIONS') {
+        const res = await parseMasterAdmissions(file, crmDb.getAllStudents());
+        setUploadPreviewModal({
+          title: `Master Admissions Preview (${file.name})`,
+          totalRows: res.records.length,
+          sampleRows: res.records.slice(0, 5),
+          errorCount: res.errorCount,
+          errors: res.errors,
+          onConfirm: async () => {
+            await crmDb.registerAdmissionsBatchAsync(res.records);
+            crmDb.recordUploadBatch({
+              type: 'ADMISSION',
+              session_id: activeSessionIdVal,
+              file_name: file.name,
+              uploaded_by: currentUser.name,
+              total_rows: res.records.length,
+              inserted_count: res.successCount,
+              updated_count: res.updatedCount,
+              unmatched_count: 0,
+              error_count: res.errorCount,
+              status: res.errorCount > 0 ? 'PARTIAL' : 'SUCCESS',
+            });
+            setUploadPreviewModal(null);
+            showAdminNotice(`Ingested ${res.records.length} student admissions and synced.`);
+            refreshAll();
+          },
+        });
+      } else if (type === 'EXAMS') {
+        const res = await parseExamResults(file);
+        setUploadPreviewModal({
+          title: `Exam Results Preview (${file.name})`,
+          totalRows: res.records.length,
+          sampleRows: res.records.slice(0, 5),
+          errorCount: res.errorCount,
+          errors: res.errors,
+          onConfirm: () => {
+            crmDb.addExamResults(res.records);
+            crmDb.recordUploadBatch({
+              type: 'EXAM',
+              session_id: activeSessionIdVal,
+              file_name: file.name,
+              uploaded_by: currentUser.name,
+              total_rows: res.records.length,
+              inserted_count: res.successCount,
+              updated_count: 0,
+              unmatched_count: 0,
+              error_count: res.errorCount,
+              status: res.errorCount > 0 ? 'PARTIAL' : 'SUCCESS',
+            });
+            setUploadPreviewModal(null);
+            showAdminNotice(`Uploaded ${res.records.length} exam results.`);
+            refreshAll();
+          },
+        });
+      } else if (type === 'ATTENDANCE') {
+        const res = await parseAttendance(file);
+        setUploadPreviewModal({
+          title: `Attendance Matrix Preview (${file.name})`,
+          totalRows: res.records.length,
+          sampleRows: res.records.slice(0, 5),
+          errorCount: res.errorCount,
+          errors: res.errors,
+          onConfirm: () => {
+            crmDb.addAttendanceRecords(res.records);
+            crmDb.recordUploadBatch({
+              type: 'ATTENDANCE',
+              session_id: activeSessionIdVal,
+              file_name: file.name,
+              uploaded_by: currentUser.name,
+              total_rows: res.records.length,
+              inserted_count: res.successCount,
+              updated_count: 0,
+              unmatched_count: 0,
+              error_count: res.errorCount,
+              status: res.errorCount > 0 ? 'PARTIAL' : 'SUCCESS',
+            });
+            setUploadPreviewModal(null);
+            showAdminNotice(`Uploaded ${res.records.length} attendance records.`);
+            refreshAll();
+          },
+        });
+      } else if (type === 'EXTERNAL_LEADS') {
+        const res = await parseExternalLeads(file);
+        setUploadPreviewModal({
+          title: `External Leads Preview (${file.name})`,
+          totalRows: res.records.length,
+          sampleRows: res.records.slice(0, 5),
+          errorCount: res.errorCount,
+          errors: res.errors,
+          onConfirm: () => {
+            crmDb.addExternalLeadsBatch(res.records);
+            crmDb.recordUploadBatch({
+              type: 'LEADS',
+              session_id: activeSessionIdVal,
+              file_name: file.name,
+              uploaded_by: currentUser.name,
+              total_rows: res.records.length,
+              inserted_count: res.successCount,
+              updated_count: 0,
+              unmatched_count: 0,
+              error_count: res.errorCount,
+              status: res.errorCount > 0 ? 'PARTIAL' : 'SUCCESS',
+            });
+            setUploadPreviewModal(null);
+            showAdminNotice(`Imported ${res.records.length} external leads.`);
+            refreshAll();
+          },
+        });
+      }
+    } catch (err: any) {
+      showAdminNotice(err.message || 'Failed to parse Excel/CSV file.', 'error');
+    }
+  };
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
@@ -687,81 +819,187 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
           <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
             {/* Card 1: Master Admissions */}
-            <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-2xs space-y-3">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-bold uppercase text-slate-500">Sheet 1</span>
-                <FileSpreadsheet className="w-4 h-4 text-blue-600" />
+            <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-2xs space-y-3 flex flex-col justify-between">
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold uppercase text-slate-500">Sheet 1</span>
+                  <FileSpreadsheet className="w-4 h-4 text-blue-600" />
+                </div>
+                <h3 className="font-bold text-slate-900 text-sm">Master Admissions</h3>
+                <p className="text-[11px] text-slate-500">
+                  22 standard attributes with cross-batch identity linking by person_key.
+                </p>
               </div>
-              <h3 className="font-bold text-slate-900 text-sm">Master Admissions</h3>
-              <p className="text-[11px] text-slate-500">
-                22 standard attributes with cross-batch identity linking by person_key.
-              </p>
-              <button
-                onClick={() => generateSampleTemplate('ADMISSIONS')}
-                className="w-full py-1.5 px-3 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded text-xs font-bold transition-all cursor-pointer flex items-center justify-center gap-1.5"
-              >
-                <Download className="w-3.5 h-3.5" />
-                <span>Sample Excel</span>
-              </button>
+              <div className="space-y-2 pt-2">
+                <label className="w-full py-1.5 px-3 bg-slate-950 hover:bg-slate-800 text-white rounded text-xs font-bold transition-all cursor-pointer flex items-center justify-center gap-1.5">
+                  <Upload className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Upload Excel / CSV</span>
+                  <input
+                    type="file"
+                    accept=".xlsx,.xls,.csv"
+                    className="hidden"
+                    onChange={(e) => void handleExcelUpload('ADMISSIONS', e)}
+                  />
+                </label>
+                <button
+                  onClick={() => generateSampleTemplate('ADMISSIONS')}
+                  className="w-full py-1.5 px-3 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded text-xs font-bold transition-all cursor-pointer flex items-center justify-center gap-1.5"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Sample Excel</span>
+                </button>
+              </div>
             </div>
 
             {/* Card 2: Exam Results */}
-            <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-2xs space-y-3">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-bold uppercase text-slate-500">Sheet 2</span>
-                <Sparkles className="w-4 h-4 text-emerald-600" />
+            <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-2xs space-y-3 flex flex-col justify-between">
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold uppercase text-slate-500">Sheet 2</span>
+                  <Sparkles className="w-4 h-4 text-emerald-600" />
+                </div>
+                <h3 className="font-bold text-slate-900 text-sm">Exam Results</h3>
+                <p className="text-[11px] text-slate-500">
+                  Dynamic subject marks, ranks, and percentages linked by Admission No.
+                </p>
               </div>
-              <h3 className="font-bold text-slate-900 text-sm">Exam Results</h3>
-              <p className="text-[11px] text-slate-500">
-                Dynamic subject marks, ranks, and percentages linked by Admission No.
-              </p>
-              <button
-                onClick={() => generateSampleTemplate('EXAMS')}
-                className="w-full py-1.5 px-3 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded text-xs font-bold transition-all cursor-pointer flex items-center justify-center gap-1.5"
-              >
-                <Download className="w-3.5 h-3.5" />
-                <span>Sample Excel</span>
-              </button>
+              <div className="space-y-2 pt-2">
+                <label className="w-full py-1.5 px-3 bg-slate-950 hover:bg-slate-800 text-white rounded text-xs font-bold transition-all cursor-pointer flex items-center justify-center gap-1.5">
+                  <Upload className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Upload Excel / CSV</span>
+                  <input
+                    type="file"
+                    accept=".xlsx,.xls,.csv"
+                    className="hidden"
+                    onChange={(e) => void handleExcelUpload('EXAMS', e)}
+                  />
+                </label>
+                <button
+                  onClick={() => generateSampleTemplate('EXAMS')}
+                  className="w-full py-1.5 px-3 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded text-xs font-bold transition-all cursor-pointer flex items-center justify-center gap-1.5"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Sample Excel</span>
+                </button>
+              </div>
             </div>
 
             {/* Card 3: Attendance */}
-            <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-2xs space-y-3">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-bold uppercase text-slate-500">Sheet 3</span>
-                <Calendar className="w-4 h-4 text-purple-600" />
+            <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-2xs space-y-3 flex flex-col justify-between">
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold uppercase text-slate-500">Sheet 3</span>
+                  <Calendar className="w-4 h-4 text-purple-600" />
+                </div>
+                <h3 className="font-bold text-slate-900 text-sm">Attendance Matrix</h3>
+                <p className="text-[11px] text-slate-500">
+                  Matrix, Combined-Header, or Flat sheets with P/A/L status (blank = not recorded).
+                </p>
               </div>
-              <h3 className="font-bold text-slate-900 text-sm">Attendance Matrix</h3>
-              <p className="text-[11px] text-slate-500">
-                Matrix, Combined-Header, or Flat sheets with P/A/L status (blank = not recorded).
-              </p>
-              <button
-                onClick={() => generateSampleTemplate('ATTENDANCE')}
-                className="w-full py-1.5 px-3 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded text-xs font-bold transition-all cursor-pointer flex items-center justify-center gap-1.5"
-              >
-                <Download className="w-3.5 h-3.5" />
-                <span>Sample Excel</span>
-              </button>
+              <div className="space-y-2 pt-2">
+                <label className="w-full py-1.5 px-3 bg-slate-950 hover:bg-slate-800 text-white rounded text-xs font-bold transition-all cursor-pointer flex items-center justify-center gap-1.5">
+                  <Upload className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Upload Excel / CSV</span>
+                  <input
+                    type="file"
+                    accept=".xlsx,.xls,.csv"
+                    className="hidden"
+                    onChange={(e) => void handleExcelUpload('ATTENDANCE', e)}
+                  />
+                </label>
+                <button
+                  onClick={() => generateSampleTemplate('ATTENDANCE')}
+                  className="w-full py-1.5 px-3 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded text-xs font-bold transition-all cursor-pointer flex items-center justify-center gap-1.5"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Sample Excel</span>
+                </button>
+              </div>
             </div>
 
             {/* Card 4: External Leads */}
-            <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-2xs space-y-3">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-bold uppercase text-slate-500">Sheet 4</span>
-                <PhoneCall className="w-4 h-4 text-amber-600" />
+            <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-2xs space-y-3 flex flex-col justify-between">
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold uppercase text-slate-500">Sheet 4</span>
+                  <PhoneCall className="w-4 h-4 text-amber-600" />
+                </div>
+                <h3 className="font-bold text-slate-900 text-sm">External Leads</h3>
+                <p className="text-[11px] text-slate-500">
+                  Permissive marketing lists. Unenrolled leads never mixed into student directory.
+                </p>
               </div>
-              <h3 className="font-bold text-slate-900 text-sm">External Leads</h3>
-              <p className="text-[11px] text-slate-500">
-                Permissive marketing lists. Unenrolled leads never mixed into student directory.
-              </p>
-              <button
-                onClick={() => generateSampleTemplate('ADMISSIONS')}
-                className="w-full py-1.5 px-3 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded text-xs font-bold transition-all cursor-pointer flex items-center justify-center gap-1.5"
-              >
-                <Download className="w-3.5 h-3.5" />
-                <span>Sample Excel</span>
-              </button>
+              <div className="space-y-2 pt-2">
+                <label className="w-full py-1.5 px-3 bg-slate-950 hover:bg-slate-800 text-white rounded text-xs font-bold transition-all cursor-pointer flex items-center justify-center gap-1.5">
+                  <Upload className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Upload Excel / CSV</span>
+                  <input
+                    type="file"
+                    accept=".xlsx,.xls,.csv"
+                    className="hidden"
+                    onChange={(e) => void handleExcelUpload('EXTERNAL_LEADS', e)}
+                  />
+                </label>
+                <button
+                  onClick={() => generateSampleTemplate('LEADS')}
+                  className="w-full py-1.5 px-3 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded text-xs font-bold transition-all cursor-pointer flex items-center justify-center gap-1.5"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Sample Excel</span>
+                </button>
+              </div>
             </div>
           </div>
+
+          {uploadPreviewModal && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-xs">
+              <div className="bg-white rounded-2xl shadow-2xl max-w-xl w-full border border-slate-200 overflow-hidden text-xs">
+                <div className="p-4 bg-slate-950 text-white flex items-center justify-between">
+                  <h3 className="font-bold text-sm">{uploadPreviewModal.title}</h3>
+                  <button
+                    onClick={() => setUploadPreviewModal(null)}
+                    className="text-slate-400 hover:text-white font-bold px-1 cursor-pointer"
+                  >
+                    ✕
+                  </button>
+                </div>
+                <div className="p-5 space-y-3">
+                  <div className="grid grid-cols-2 gap-3 font-mono">
+                    <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-lg">
+                      <span className="text-[10px] text-emerald-700 block">READY TO INGEST</span>
+                      <strong className="text-lg text-emerald-900">{uploadPreviewModal.totalRows} rows</strong>
+                    </div>
+                    <div className="p-3 bg-rose-50 border border-rose-200 rounded-lg">
+                      <span className="text-[10px] text-rose-700 block">SKIPPED / ERRORS</span>
+                      <strong className="text-lg text-rose-900">{uploadPreviewModal.errorCount} rows</strong>
+                    </div>
+                  </div>
+                  {uploadPreviewModal.errors.length > 0 && (
+                    <div className="max-h-24 overflow-y-auto bg-rose-50 p-2 rounded border border-rose-200 text-[11px] text-rose-800 space-y-0.5">
+                      {uploadPreviewModal.errors.slice(0, 10).map((err, i) => (
+                        <div key={i}>{err}</div>
+                      ))}
+                    </div>
+                  )}
+                  <div className="flex justify-end gap-2 pt-3 border-t border-slate-200">
+                    <button
+                      onClick={() => setUploadPreviewModal(null)}
+                      className="px-4 py-2 border border-slate-300 rounded-lg font-bold cursor-pointer"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      disabled={uploadPreviewModal.totalRows === 0}
+                      onClick={() => void uploadPreviewModal.onConfirm()}
+                      className="px-5 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-400 text-white font-bold rounded-lg cursor-pointer"
+                    >
+                      Confirm & Save to Server
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* Upload Batches History & 1-Click Rollback (Section 7.6) */}
           <div className="bg-white border border-slate-200 rounded-xl shadow-2xs overflow-hidden">
@@ -1467,6 +1705,81 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             </div>
           </div>
 
+          {/* Cloud Persistence & State Backup Sync Console */}
+          <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-2xs space-y-3 text-xs">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+                  <Database className="w-4 h-4 text-blue-600" />
+                  <span>Cloud Database Status & Backup Sync</span>
+                </h3>
+                <p className="text-[11px] text-slate-500 mt-0.5">
+                  {persistenceMode === 'POSTGRESQL_CLOUD'
+                    ? 'Connected to PostgreSQL Cloud Storage (Unlimited Refreshes, Persistent across Render restarts).'
+                    : 'Running on Local JSON Storage. To persist forever on Render Free Tier with unlimited refreshes, set DATABASE_URL (e.g. free Neon.tech PostgreSQL) or use 1-click JSON Backup/Restore below.'}
+                </p>
+              </div>
+              <span
+                className={`px-2.5 py-1 rounded-full text-[10px] font-bold self-start sm:self-center ${
+                  persistenceMode === 'POSTGRESQL_CLOUD'
+                    ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
+                    : 'bg-amber-100 text-amber-800 border border-amber-200'
+                }`}
+              >
+                {persistenceMode === 'POSTGRESQL_CLOUD' ? 'POSTGRESQL CLOUD ACTIVE' : 'LOCAL JSON MODE'}
+              </span>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-slate-100">
+              <button
+                type="button"
+                onClick={async () => {
+                  try {
+                    const backup = await crmDb.downloadServerBackup();
+                    const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `narayana_crm_backup_${getTodayCalendarDate()}.json`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                    showAdminNotice('Full CRM state backup downloaded.');
+                  } catch (err: any) {
+                    showAdminNotice(err.message || 'Backup export failed.', 'error');
+                  }
+                }}
+                className="px-3.5 py-2 bg-slate-950 hover:bg-slate-800 text-white font-bold rounded-lg flex items-center gap-1.5 cursor-pointer"
+              >
+                <Download className="w-3.5 h-3.5 text-amber-400" />
+                <span>Export Full State Backup (.json)</span>
+              </button>
+
+              <label className="px-3.5 py-2 bg-white hover:bg-slate-50 text-slate-800 border border-slate-300 font-bold rounded-lg flex items-center gap-1.5 cursor-pointer">
+                <Upload className="w-3.5 h-3.5 text-blue-600" />
+                <span>Restore / Sync From Backup (.json)</span>
+                <input
+                  type="file"
+                  accept=".json"
+                  className="hidden"
+                  onChange={async (e) => {
+                    const file = e.target.files?.[0];
+                    e.target.value = '';
+                    if (!file) return;
+                    try {
+                      const text = await file.text();
+                      const json = JSON.parse(text);
+                      const res = await crmDb.restoreServerBackup(json);
+                      showAdminNotice(`Restored backup cleanly (${res.usersCount} staff accounts synced).`);
+                      refreshAll();
+                    } catch (err: any) {
+                      showAdminNotice(err.message || 'Invalid backup file.', 'error');
+                    }
+                  }}
+                />
+              </label>
+            </div>
+          </div>
+
           {/* Audit Logs Table */}
           <div className="bg-white border border-slate-200 rounded-xl shadow-2xs overflow-hidden">
             <div className="p-4 border-b border-slate-200 bg-slate-50/50">
@@ -1632,6 +1945,153 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                           </div>
                         ))}
                       </div>
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+          )}
+
+          {/* Report Content: B) Calling Report */}
+          {reportSubTab === 'CALLING' && (
+            <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-2xs space-y-4 text-xs">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div>
+                  <h3 className="font-bold text-slate-900 text-sm">B) Master Calling & Disposition Report</h3>
+                  <p className="text-slate-500 text-[11px]">Separate calling summary with disposition counts, latency audit, and Excel download</p>
+                </div>
+                <button
+                  onClick={() => {
+                    const rep = crmDb.getCallingReport({
+                      mentorId: reportMentorId,
+                      disposition: reportDisposition,
+                      fromDate: reportFromDate || undefined,
+                      toDate: reportToDate || undefined,
+                    });
+                    exportCallingReportToExcel(
+                      rep.calls,
+                      `Narayana_Calling_Report_${getTodayCalendarDate()}`
+                    );
+                  }}
+                  className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded flex items-center gap-1.5 cursor-pointer self-start sm:self-auto"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Download Calling Excel</span>
+                </button>
+              </div>
+
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                <div>
+                  <label className="block text-[10px] font-bold text-slate-500 uppercase mb-1">From Date</label>
+                  <input
+                    type="date"
+                    value={reportFromDate}
+                    onChange={(e) => setReportFromDate(e.target.value)}
+                    className="w-full p-1.5 border border-slate-300 rounded bg-white"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[10px] font-bold text-slate-500 uppercase mb-1">To Date</label>
+                  <input
+                    type="date"
+                    value={reportToDate}
+                    onChange={(e) => setReportToDate(e.target.value)}
+                    className="w-full p-1.5 border border-slate-300 rounded bg-white"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[10px] font-bold text-slate-500 uppercase mb-1">Mentor</label>
+                  <select
+                    value={reportMentorId}
+                    onChange={(e) => setReportMentorId(e.target.value)}
+                    className="w-full p-1.5 border border-slate-300 rounded bg-white font-semibold"
+                  >
+                    <option value="ALL">All Mentors</option>
+                    {mentorsList.map((m) => (
+                      <option key={m.id} value={m.id}>{m.name}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-[10px] font-bold text-slate-500 uppercase mb-1">Disposition</label>
+                  <select
+                    value={reportDisposition}
+                    onChange={(e) => setReportDisposition(e.target.value)}
+                    className="w-full p-1.5 border border-slate-300 rounded bg-white font-semibold"
+                  >
+                    <option value="ALL">All Dispositions</option>
+                    <option value="CONNECTED">CONNECTED</option>
+                    <option value="CALLBACK_REQUESTED">CALLBACK_REQUESTED</option>
+                    <option value="BUSY">BUSY</option>
+                    <option value="RINGING_NO_RESPONSE">RINGING_NO_RESPONSE</option>
+                    <option value="SWITCHED_OFF">SWITCHED_OFF</option>
+                    <option value="NOT_REACHABLE">NOT_REACHABLE</option>
+                    <option value="WRONG_NUMBER">WRONG_NUMBER</option>
+                  </select>
+                </div>
+              </div>
+
+              {(() => {
+                const rep = crmDb.getCallingReport({
+                  mentorId: reportMentorId,
+                  disposition: reportDisposition,
+                  fromDate: reportFromDate || undefined,
+                  toDate: reportToDate || undefined,
+                });
+                return (
+                  <div className="space-y-4">
+                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 text-center font-mono">
+                      <div className="bg-slate-50 p-2.5 rounded border border-slate-200">
+                        <span className="text-[10px] text-slate-500 block">UNIQUE CALL LOGS</span>
+                        <span className="text-lg font-bold">{rep.totalCalls}</span>
+                      </div>
+                      <div className="bg-slate-50 p-2.5 rounded border border-slate-200">
+                        <span className="text-[10px] text-slate-500 block">TOTAL DIAL ATTEMPTS</span>
+                        <span className="text-lg font-bold text-blue-700">{rep.totalAttempts}</span>
+                      </div>
+                      <div className="bg-slate-50 p-2.5 rounded border border-slate-200">
+                        <span className="text-[10px] text-slate-500 block">CONNECTED CALLS</span>
+                        <span className="text-lg font-bold text-emerald-700">{rep.dispositionCounts['CONNECTED'] || 0}</span>
+                      </div>
+                    </div>
+
+                    <div className="border border-slate-200 rounded-lg overflow-x-auto">
+                      <table className="w-full text-left text-xs">
+                        <thead>
+                          <tr className="bg-slate-100 text-slate-700 font-bold uppercase text-[10px]">
+                            <th className="py-2.5 px-3">Date (IST)</th>
+                            <th className="py-2.5 px-3">Mentor</th>
+                            <th className="py-2.5 px-3">Adm #</th>
+                            <th className="py-2.5 px-3">Disposition</th>
+                            <th className="py-2.5 px-3">Duration</th>
+                            <th className="py-2.5 px-3">Remark</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-200">
+                          {rep.calls.length === 0 ? (
+                            <tr>
+                              <td colSpan={6} className="py-8 text-center text-slate-400">
+                                No calls matching selected filters.
+                              </td>
+                            </tr>
+                          ) : (
+                            rep.calls.slice(0, 100).map((c) => (
+                              <tr key={c.id} className="hover:bg-slate-50">
+                                <td className="py-2 px-3 font-mono text-slate-600">{c.calendar_date}</td>
+                                <td className="py-2 px-3 font-bold text-slate-900">{c.mentor_name}</td>
+                                <td className="py-2 px-3 font-mono">#{c.student_id}</td>
+                                <td className="py-2 px-3">
+                                  <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-slate-100">
+                                    {c.disposition}
+                                  </span>
+                                </td>
+                                <td className="py-2 px-3 font-mono">{c.call_duration_sec}s</td>
+                                <td className="py-2 px-3 text-slate-700">{c.remark}</td>
+                              </tr>
+                            ))
+                          )}
+                        </tbody>
+                      </table>
                     </div>
                   </div>
                 );

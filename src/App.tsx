@@ -49,13 +49,38 @@ export default function App() {
       if (!active) return;
       setAllSessions([...crmDb.getSessions()]);
       setActiveSession(crmDb.getActiveSession());
-      if (authenticatedUser && !crmDb.hasServerSession()) {
-        // Session invalidated (e.g. account deactivated by admin)
-        try {
-          localStorage.removeItem('narayana_crm_auth_session');
-        } catch {}
-        setAuthenticatedUser(null);
-      }
+      setAuthenticatedUser((prev) => {
+        if (!prev) return null;
+        if (!crmDb.hasServerSession()) {
+          try {
+            localStorage.removeItem('narayana_crm_auth_session');
+          } catch {}
+          return null;
+        }
+        const latest = crmDb.getUsers().find((u) => u.id === prev.id);
+        if (latest) {
+          if (latest.status === 'INACTIVE') {
+            crmDb.disconnectServerSync();
+            try {
+              localStorage.removeItem('narayana_crm_auth_session');
+            } catch {}
+            return null;
+          }
+          if (
+            latest.name !== prev.name ||
+            latest.department !== prev.department ||
+            latest.role !== prev.role ||
+            latest.email !== prev.email
+          ) {
+            const updated = { ...prev, name: latest.name, department: latest.department, role: latest.role, email: latest.email };
+            try {
+              localStorage.setItem('narayana_crm_auth_session', JSON.stringify(updated));
+            } catch {}
+            return updated;
+          }
+        }
+        return prev;
+      });
     });
 
     if (authenticatedUser) {

@@ -31,6 +31,8 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess }) => {
   const [failCount, setFailCount] = useState<number>(0);
   const [isLocked, setIsLocked] = useState<boolean>(false);
 
+  const [wakingServer, setWakingServer] = useState<boolean>(false);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
@@ -46,19 +48,27 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess }) => {
     }
 
     setIsLoading(true);
+    const wakeTimer = setTimeout(() => setWakingServer(true), 2500);
 
     try {
       const authRes = await crmDb.authenticateWithServer(identifier, password);
+      clearTimeout(wakeTimer);
+      setWakingServer(false);
 
       if (!authRes.success || !authRes.user) {
-        const nextFails = failCount + 1;
-        setFailCount(nextFails);
-        if (nextFails >= 5) {
-          setIsLocked(true);
-          setError('Security Lockout: Too many invalid attempts. Access locked for 15 minutes.');
-        } else {
-          setError(authRes.error || 'Invalid credentials. Please verify your login details.');
+        const msg = authRes.error || 'Invalid credentials. Please verify your login details.';
+        const isNetworkError = msg.toLowerCase().includes('unable to reach');
+        if (!isNetworkError) {
+          const nextFails = failCount + 1;
+          setFailCount(nextFails);
+          if (nextFails >= 5) {
+            setIsLocked(true);
+            setError('Security Lockout: Too many invalid attempts. Access locked for 15 minutes.');
+            setIsLoading(false);
+            return;
+          }
         }
+        setError(msg);
         setIsLoading(false);
         return;
       }
@@ -66,7 +76,9 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess }) => {
       setIsLoading(false);
       onLoginSuccess(authRes.user);
     } catch {
-      setError('Unable to reach CRM server. Please retry.');
+      clearTimeout(wakeTimer);
+      setWakingServer(false);
+      setError('Unable to reach CRM server. Please wait a few seconds and retry.');
       setIsLoading(false);
     }
   };
@@ -153,7 +165,10 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess }) => {
                 className="w-full py-2.5 px-4 bg-slate-950 hover:bg-slate-800 disabled:bg-slate-400 text-white rounded-lg text-xs font-bold transition-all shadow-xs flex items-center justify-center gap-2 cursor-pointer active:scale-[0.99]"
               >
                 {isLoading ? (
-                  <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                  <div className="flex items-center gap-2">
+                    <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                    {wakingServer && <span className="text-[11px]">Waking server, please wait...</span>}
+                  </div>
                 ) : (
                   <span>Sign In to Workstation</span>
                 )}

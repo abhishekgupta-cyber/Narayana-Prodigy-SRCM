@@ -164,16 +164,40 @@ class CRMDatabase {
       const res = await fetch('/api/auth/me', {
         headers: { Authorization: `Bearer ${this.authToken}` },
       });
-      if (!res.ok) {
+      if (res.status === 401 || res.status === 403) {
         this.disconnectServerSync();
         return null;
+      }
+      if (!res.ok) {
+        // Render cold-start / 502 / 503: keep cached session and retry silently
+        setTimeout(() => {
+          if (this.authToken) void this.syncFromServer();
+        }, 4000);
+        try {
+          const cached = localStorage.getItem('narayana_crm_auth_session');
+          return cached ? JSON.parse(cached) : null;
+        } catch {
+          return null;
+        }
       }
       const data = await res.json();
       await this.syncFromServer();
       this.connectWebSocket();
       return data.user || null;
     } catch {
-      return null;
+      // Network offline or server waking up from sleep: keep session active and retry
+      setTimeout(() => {
+        if (this.authToken) {
+          void this.syncFromServer();
+          this.connectWebSocket();
+        }
+      }, 4000);
+      try {
+        const cached = localStorage.getItem('narayana_crm_auth_session');
+        return cached ? JSON.parse(cached) : null;
+      } catch {
+        return null;
+      }
     }
   }
 
@@ -318,31 +342,77 @@ class CRMDatabase {
     }
   }
 
-  private pushActionToServer(action: string, payload: any) {
-    if (typeof window === 'undefined' || !this.authToken || this.isHydrating) return;
+  private async pushActionToServer(
+    action: string,
+    payload: any
+  ): Promise<{ ok: boolean; error?: string; data?: any }> {
+    if (typeof window === 'undefined' || !this.authToken || this.isHydrating) {
+      return { ok: true };
+    }
     this.pendingActions += 1;
-    void fetch('/api/actions', {
+    try {
+      const res = await fetch('/api/actions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${this.authToken}`,
+        },
+        body: JSON.stringify({ action, payload }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        if (typeof data.version === 'number') {
+          this.serverVersion = Math.max(this.serverVersion, data.version);
+        }
+        return { ok: true, data };
+      }
+      if (res.status === 401) {
+        this.disconnectServerSync();
+        this.notifyListeners();
+      }
+      return { ok: false, error: data?.error || `Server error (${res.status})` };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'Unable to reach CRM server.' };
+    } finally {
+      this.pendingActions = Math.max(0, this.pendingActions - 1);
+    }
+  }
+
+  public async getServerHealth(): Promise<{ ok: boolean; persistenceMode?: string; version?: number }> {
+    if (typeof window === 'undefined' || typeof fetch === 'undefined') return { ok: false };
+    try {
+      const res = await fetch('/api/health');
+      if (!res.ok) return { ok: false };
+      return await res.json();
+    } catch {
+      return { ok: false };
+    }
+  }
+
+  public async downloadServerBackup(): Promise<any> {
+    if (typeof window === 'undefined' || !this.authToken) throw new Error('Not authenticated');
+    const res = await fetch('/api/admin/backup-state', {
+      headers: { Authorization: `Bearer ${this.authToken}` },
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data?.error || 'Failed to export server backup');
+    return data;
+  }
+
+  public async restoreServerBackup(backupJson: any): Promise<{ version: number; usersCount: number }> {
+    if (typeof window === 'undefined' || !this.authToken) throw new Error('Not authenticated');
+    const res = await fetch('/api/admin/restore-state', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${this.authToken}`,
       },
-      body: JSON.stringify({ action, payload }),
-    })
-      .then(async (res) => {
-        if (res.ok) {
-          const data = await res.json().catch(() => ({}));
-          if (typeof data.version === 'number') {
-            this.serverVersion = Math.max(this.serverVersion, data.version);
-          }
-        } else if (res.status === 401) {
-          this.disconnectServerSync();
-        }
-      })
-      .catch(() => {})
-      .finally(() => {
-        this.pendingActions = Math.max(0, this.pendingActions - 1);
-      });
+      body: JSON.stringify(backupJson),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data?.error || 'Failed to restore backup');
+    await this.syncFromServer();
+    return data;
   }
 
   public async startCallSessionFromServer(params: {
@@ -597,10 +667,17 @@ class CRMDatabase {
   }
 
   public addUser(userData: Omit<User, 'id'>, adminUser?: User): User {
+    const emailLower = (userData.email || '').trim().toLowerCase();
+    if (emailLower && this.users.some((u) => u.email.toLowerCase() === emailLower)) {
+      throw new Error(`A staff account with email "${emailLower}" already exists.`);
+    }
     const newUser: User = {
       id: `user-${Date.now()}`,
       ...userData,
+      email: emailLower,
+      username: (userData.username || emailLower).trim().toLowerCase(),
       status: userData.status || 'ACTIVE',
+      failed_logins: 0,
       created_at: new Date().toISOString(),
     };
     this.users.push(newUser);
@@ -615,15 +692,140 @@ class CRMDatabase {
         meta: { name: newUser.name, role: newUser.role, designation: newUser.department },
       });
     }
-    this.pushActionToServer('USER_ADD', newUser);
+    void this.pushActionToServer('USER_ADD', newUser);
     this.notifyListeners();
     return newUser;
+  }
+
+  public async addUserAsync(userData: Omit<User, 'id'>, adminUser?: User): Promise<User> {
+    const emailLower = (userData.email || '').trim().toLowerCase();
+    if (emailLower && this.users.some((u) => u.email.toLowerCase() === emailLower)) {
+      throw new Error(`A staff account with email "${emailLower}" already exists.`);
+    }
+    const newUser: User = {
+      id: `user-${Date.now()}`,
+      ...userData,
+      email: emailLower,
+      username: (userData.username || emailLower).trim().toLowerCase(),
+      status: userData.status || 'ACTIVE',
+      failed_logins: 0,
+      created_at: new Date().toISOString(),
+    };
+
+    const res = await this.pushActionToServer('USER_ADD', newUser);
+    if (!res.ok) {
+      throw new Error(res.error || 'Failed to save new user on server.');
+    }
+
+    this.users.push(newUser);
+    this.saveUsers();
+    if (adminUser) {
+      this.logAudit({
+        user_name: adminUser.name,
+        user_role: adminUser.role,
+        action: 'ASSIGNMENT',
+        entity: 'User',
+        entity_id: newUser.id,
+        meta: { name: newUser.name, role: newUser.role, designation: newUser.department },
+      });
+    }
+    this.notifyListeners();
+    return newUser;
+  }
+
+  private syncActiveAuthSessionIfSelf(updatedUser: User) {
+    try {
+      if (typeof localStorage === 'undefined') return;
+      const saved = localStorage.getItem('narayana_crm_auth_session');
+      if (!saved) return;
+      const parsed = JSON.parse(saved);
+      if (parsed?.id === updatedUser.id) {
+        const { password, password_hash, ...safe } = updatedUser as any;
+        localStorage.setItem('narayana_crm_auth_session', JSON.stringify(safe));
+      }
+    } catch {}
   }
 
   public updateUser(id: string, partial: Partial<User>, adminUser?: User): User {
     const idx = this.users.findIndex((u) => u.id === id);
     if (idx === -1) throw new Error('User not found');
-    this.users[idx] = { ...this.users[idx], ...partial };
+    const cleanPartial: Partial<User> = { ...partial };
+    if (cleanPartial.email) {
+      const nextEmail = cleanPartial.email.trim().toLowerCase();
+      if (this.users.some((u) => u.id !== id && u.email.toLowerCase() === nextEmail)) {
+        throw new Error(`Another account already uses email "${nextEmail}".`);
+      }
+      cleanPartial.email = nextEmail;
+    }
+    if (cleanPartial.password_hash) {
+      cleanPartial.failed_logins = 0;
+      cleanPartial.locked_until = undefined;
+      cleanPartial.password = undefined;
+    }
+    this.users[idx] = { ...this.users[idx], ...cleanPartial };
+    this.saveUsers();
+    this.syncActiveAuthSessionIfSelf(this.users[idx]);
+    if (adminUser) {
+      this.logAudit({
+        user_name: adminUser.name,
+        user_role: adminUser.role,
+        action: 'SETTINGS_CHANGE',
+        entity: 'User',
+        entity_id: id,
+        meta: cleanPartial,
+      });
+    }
+    void this.pushActionToServer('USER_UPDATE', { id, partial: cleanPartial });
+    this.notifyListeners();
+    return this.users[idx];
+  }
+
+  public async updateUserAsync(id: string, partial: Partial<User>, adminUser?: User): Promise<User> {
+    const idx = this.users.findIndex((u) => u.id === id);
+    if (idx === -1) throw new Error('User not found');
+    const cleanPartial: Partial<User> = { ...partial };
+    if (cleanPartial.email) {
+      const nextEmail = cleanPartial.email.trim().toLowerCase();
+      if (this.users.some((u) => u.id !== id && u.email.toLowerCase() === nextEmail)) {
+        throw new Error(`Another account already uses email "${nextEmail}".`);
+      }
+      cleanPartial.email = nextEmail;
+    }
+    if (cleanPartial.password_hash) {
+      cleanPartial.failed_logins = 0;
+      cleanPartial.locked_until = undefined;
+      cleanPartial.password = undefined;
+    }
+
+    const res = await this.pushActionToServer('USER_UPDATE', { id, partial: cleanPartial });
+    if (!res.ok) {
+      throw new Error(res.error || 'Failed to update user on server.');
+    }
+
+    this.users[idx] = { ...this.users[idx], ...cleanPartial };
+    this.saveUsers();
+    this.syncActiveAuthSessionIfSelf(this.users[idx]);
+    if (adminUser) {
+      this.logAudit({
+        user_name: adminUser.name,
+        user_role: adminUser.role,
+        action: 'SETTINGS_CHANGE',
+        entity: 'User',
+        entity_id: id,
+        meta: cleanPartial,
+      });
+    }
+    this.notifyListeners();
+    return this.users[idx];
+  }
+
+  public deleteUser(id: string, adminUser?: User): void {
+    if (adminUser && adminUser.id === id) {
+      throw new Error('You cannot delete your own active administrator account.');
+    }
+    const idx = this.users.findIndex((u) => u.id === id);
+    if (idx === -1) throw new Error('User not found');
+    const [removed] = this.users.splice(idx, 1);
     this.saveUsers();
     if (adminUser) {
       this.logAudit({
@@ -632,12 +834,38 @@ class CRMDatabase {
         action: 'SETTINGS_CHANGE',
         entity: 'User',
         entity_id: id,
-        meta: partial,
+        meta: { deletedName: removed.name, deletedEmail: removed.email },
       });
     }
-    this.pushActionToServer('USER_UPDATE', { id, partial });
+    void this.pushActionToServer('USER_DELETE', { id });
     this.notifyListeners();
-    return this.users[idx];
+  }
+
+  public async deleteUserAsync(id: string, adminUser?: User): Promise<void> {
+    if (adminUser && adminUser.id === id) {
+      throw new Error('You cannot delete your own active administrator account.');
+    }
+    const idx = this.users.findIndex((u) => u.id === id);
+    if (idx === -1) throw new Error('User not found');
+
+    const res = await this.pushActionToServer('USER_DELETE', { id });
+    if (!res.ok) {
+      throw new Error(res.error || 'Failed to delete user on server.');
+    }
+
+    const [removed] = this.users.splice(idx, 1);
+    this.saveUsers();
+    if (adminUser) {
+      this.logAudit({
+        user_name: adminUser.name,
+        user_role: adminUser.role,
+        action: 'SETTINGS_CHANGE',
+        entity: 'User',
+        entity_id: id,
+        meta: { deletedName: removed.name, deletedEmail: removed.email },
+      });
+    }
+    this.notifyListeners();
   }
 
   // --------------------------------------------------------------------------
@@ -2238,6 +2466,26 @@ class CRMDatabase {
     this.saveStudents();
 
     return { enrollment_id: newStudentId, profile_id: personKey, isUpdated: false };
+  }
+
+  public async registerAdmissionsBatchAsync(students: Student[]): Promise<number> {
+    if (!students.length) return 0;
+    const res = await this.pushActionToServer('ADMISSIONS_REGISTER', { students });
+    if (!res.ok) {
+      throw new Error(res.error || 'Failed to save uploaded admissions on server.');
+    }
+    students.forEach((st) => {
+      const idx = this.students.findIndex((s) => s.admission_no === st.admission_no);
+      if (idx >= 0) {
+        this.students[idx] = { ...this.students[idx], ...st };
+      } else {
+        this.students.push(st);
+      }
+    });
+    this.students = this.processInitialStudents(this.students);
+    this.saveStudents();
+    this.notifyListeners();
+    return students.length;
   }
 
   public recordExamResult(result: {

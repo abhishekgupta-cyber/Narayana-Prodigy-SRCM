@@ -6,13 +6,15 @@ import { execSync } from 'child_process';
 import express from 'express';
 import type { Request, Response, NextFunction } from 'express';
 import { WebSocketServer, WebSocket } from 'ws';
+import { Pool } from 'pg';
 
-const PORT = 3000;
+const PORT = process.env.RENDER ? Number(process.env.PORT || 3000) : 3000;
 const DATA_DIR = path.join(process.cwd(), 'data');
 const STATE_FILE = path.join(DATA_DIR, 'crm-live-state.json');
 const SECRET_FILE = path.join(DATA_DIR, '.session-secret');
 const DEFAULT_USERS_FILE = path.join(process.cwd(), 'src', 'data', 'defaultUsers.json');
 const REAL_ADMISSIONS_FILE = path.join(process.cwd(), 'src', 'data', 'realAdmissions.json');
+const DATABASE_URL = process.env.DATABASE_URL?.trim() || '';
 
 // ---------------------------------------------------------------------------
 // IST Date & Security Helpers (matches src/services/antiCheat.ts & db.ts)
@@ -73,11 +75,18 @@ function getSessionSecret(): string {
   }
   ensureDataDir();
   if (fs.existsSync(SECRET_FILE)) {
-    return fs.readFileSync(SECRET_FILE, 'utf8').trim();
+    const existing = fs.readFileSync(SECRET_FILE, 'utf8').trim();
+    if (existing) return existing;
   }
-  const secret = crypto.randomBytes(32).toString('hex');
-  fs.writeFileSync(SECRET_FILE, secret, { mode: 0o600 });
-  return secret;
+  // Deterministic fallback so container restarts on free-tier hosts do not invalidate active tokens
+  const deterministicSecret = crypto
+    .createHash('sha256')
+    .update(`narayana-prodigy-crm-session:${DATABASE_URL || 'local-cluster'}:${process.env.RENDER_SERVICE_ID || 'narayana-crm'}`)
+    .digest('hex');
+  try {
+    fs.writeFileSync(SECRET_FILE, deterministicSecret, { mode: 0o600 });
+  } catch {}
+  return deterministicSecret;
 }
 
 const SESSION_SECRET = getSessionSecret();
@@ -214,7 +223,7 @@ function createSeedState(): ServerCRMState {
         mentor_id: mentor.id,
         assigned_date: todayIST,
         completion_status: idx % 3 === 0 ? 'COMPLETED' : 'ASSIGNED',
-        assigned_by: 'Dr. Abhishek Gupta',
+        assigned_by: 'Abhishek Gupta',
       });
     });
   }
@@ -247,12 +256,60 @@ function createSeedState(): ServerCRMState {
   };
 }
 
+let pgPool: Pool | null = null;
+let pgPersistChain: Promise<void> = Promise.resolve();
+
+function createPgPoolIfConfigured(): Pool | null {
+  if (!DATABASE_URL) return null;
+  try {
+    const isLocalhost = DATABASE_URL.includes('localhost') || DATABASE_URL.includes('127.0.0.1');
+    return new Pool({
+      connectionString: DATABASE_URL,
+      ssl: isLocalhost ? undefined : { rejectUnauthorized: false },
+      max: 5,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 10000,
+    });
+  } catch (err) {
+    console.warn('[Narayana CRM] Failed to initialize PostgreSQL pool, using local JSON fallback:', err);
+    return null;
+  }
+}
+
+function syncDefaultUsersIntoState(state: ServerCRMState): boolean {
+  if (!fs.existsSync(DEFAULT_USERS_FILE)) return false;
+  try {
+    const defaultUsers: any[] = JSON.parse(fs.readFileSync(DEFAULT_USERS_FILE, 'utf8'));
+    let changed = false;
+
+    const abhishekDefault = defaultUsers.find((u) => u.id === 'admin-1');
+    const abhishekState = state.users.find((u) => u.id === 'admin-1');
+    if (abhishekDefault && abhishekState && abhishekState.name === 'Dr. Abhishek Gupta' && abhishekDefault.name !== 'Dr. Abhishek Gupta') {
+      abhishekState.name = abhishekDefault.name;
+      changed = true;
+    }
+
+    const himaniDefault = defaultUsers.find((u) => u.id === 'admin-himani');
+    if (himaniDefault && !state.users.some((u) => u.id === 'admin-himani' || (u.email && u.email.toLowerCase() === himaniDefault.email.toLowerCase()))) {
+      state.users.splice(1, 0, { ...himaniDefault, status: himaniDefault.status || 'ACTIVE' });
+      changed = true;
+    }
+
+    return changed;
+  } catch {
+    return false;
+  }
+}
+
 function loadServerState(): ServerCRMState {
   ensureDataDir();
   if (fs.existsSync(STATE_FILE)) {
     try {
       const parsed = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
       if (parsed && Array.isArray(parsed.users) && Array.isArray(parsed.students)) {
+        if (syncDefaultUsersIntoState(parsed)) {
+          saveServerStateLocal(parsed);
+        }
         return parsed;
       }
     } catch (err) {
@@ -260,19 +317,86 @@ function loadServerState(): ServerCRMState {
     }
   }
   const seeded = createSeedState();
-  saveServerState(seeded);
+  saveServerStateLocal(seeded);
   return seeded;
 }
 
-function saveServerState(state: ServerCRMState) {
-  ensureDataDir();
-  const tmpFile = `${STATE_FILE}.tmp-${Date.now()}`;
-  fs.writeFileSync(tmpFile, JSON.stringify(state), 'utf8');
-  fs.renameSync(tmpFile, STATE_FILE);
+function saveServerStateLocal(state: ServerCRMState) {
+  try {
+    ensureDataDir();
+    const tmpFile = `${STATE_FILE}.tmp-${Date.now()}`;
+    fs.writeFileSync(tmpFile, JSON.stringify(state), 'utf8');
+    fs.renameSync(tmpFile, STATE_FILE);
+  } catch (err) {
+    console.warn('[Narayana CRM] Local state file save warning:', err);
+  }
 }
 
-const serverState: ServerCRMState = loadServerState();
+function persistStateToPostgres(state: ServerCRMState) {
+  if (!pgPool) return;
+  const snapshotJson = JSON.stringify(state);
+  pgPersistChain = pgPersistChain
+    .then(async () => {
+      await pgPool!.query(
+        `INSERT INTO crm_app_state (id, state, updated_at)
+         VALUES ('primary', $1::jsonb, NOW())
+         ON CONFLICT (id) DO UPDATE SET state = EXCLUDED.state, updated_at = NOW()`,
+        [snapshotJson]
+      );
+    })
+    .catch((err) => {
+      console.error('[Narayana CRM] PostgreSQL save error:', err);
+    });
+}
+
+function saveServerState(state: ServerCRMState) {
+  saveServerStateLocal(state);
+  persistStateToPostgres(state);
+}
+
+let serverState: ServerCRMState = loadServerState();
 const activeDialSessions = new Map<string, { startedAt: string; contactUsed: 'PRIMARY' | 'ALTERNATE' }>();
+
+async function initCloudPersistence(): Promise<void> {
+  pgPool = createPgPoolIfConfigured();
+  if (!pgPool) {
+    console.log('[Narayana CRM] Persistence mode: LOCAL_JSON (set DATABASE_URL for unlimited-refresh PostgreSQL cloud sync)');
+    return;
+  }
+
+  try {
+    await pgPool.query(`
+      CREATE TABLE IF NOT EXISTS crm_app_state (
+        id TEXT PRIMARY KEY,
+        state JSONB NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+
+    const res = await pgPool.query(`SELECT state FROM crm_app_state WHERE id = 'primary' LIMIT 1`);
+    if (res.rows.length > 0 && res.rows[0]?.state) {
+      const dbState = res.rows[0].state as ServerCRMState;
+      if (dbState && Array.isArray(dbState.users) && Array.isArray(dbState.students)) {
+        syncDefaultUsersIntoState(dbState);
+        serverState = dbState;
+        saveServerStateLocal(serverState);
+        console.log(`[Narayana CRM] Loaded state from PostgreSQL (version ${serverState.version}, ${serverState.users.length} users)`);
+        return;
+      }
+    }
+
+    await pgPool.query(
+      `INSERT INTO crm_app_state (id, state, updated_at)
+       VALUES ('primary', $1::jsonb, NOW())
+       ON CONFLICT (id) DO UPDATE SET state = EXCLUDED.state, updated_at = NOW()`,
+      [JSON.stringify(serverState)]
+    );
+    console.log('[Narayana CRM] Seeded PostgreSQL cloud database from initial state.');
+  } catch (err) {
+    console.error('[Narayana CRM] PostgreSQL initialization failed, falling back to local JSON:', err);
+    pgPool = null;
+  }
+}
 
 function sanitizeUserForClient(u: any) {
   if (!u) return null;
@@ -400,6 +524,8 @@ function broadcastStateChanged(action: string, actorId: string, affectedMentorId
 }
 
 async function startServer() {
+  await initCloudPersistence();
+
   const app = express();
   app.use(express.json({ limit: '25mb' }));
 
@@ -421,7 +547,50 @@ async function startServer() {
   };
 
   app.get('/api/health', (_req, res) => {
-    res.json({ ok: true, version: serverState.version, time: new Date().toISOString() });
+    res.json({
+      ok: true,
+      version: serverState.version,
+      persistenceMode: pgPool ? 'POSTGRESQL_CLOUD' : 'LOCAL_JSON',
+      time: new Date().toISOString(),
+    });
+  });
+
+  app.get('/api/admin/backup-state', requireAuth, (req: AuthedRequest, res) => {
+    if (req.authUser.role !== 'SUPER_ADMIN') {
+      res.status(403).json({ error: 'Forbidden: Super Admin access required.' });
+      return;
+    }
+    res.json({
+      exportedAt: new Date().toISOString(),
+      persistenceMode: pgPool ? 'POSTGRESQL_CLOUD' : 'LOCAL_JSON',
+      state: serverState,
+    });
+  });
+
+  app.post('/api/admin/restore-state', requireAuth, (req: AuthedRequest, res) => {
+    if (req.authUser.role !== 'SUPER_ADMIN') {
+      res.status(403).json({ error: 'Forbidden: Super Admin access required.' });
+      return;
+    }
+    const incoming = req.body?.state || req.body;
+    if (!incoming || !Array.isArray(incoming.users) || !Array.isArray(incoming.students)) {
+      res.status(400).json({ error: 'Invalid state backup file.' });
+      return;
+    }
+    serverState = {
+      ...incoming,
+      version: Math.max(serverState.version + 1, Number(incoming.version || 1) + 1),
+    };
+    appendAudit({
+      user_name: req.authUser.name,
+      user_role: req.authUser.role,
+      action: 'SETTINGS_CHANGE',
+      entity: 'SystemState',
+      entity_id: 'restore-backup',
+      meta: { usersCount: serverState.users.length, studentsCount: serverState.students.length },
+    });
+    broadcastStateChanged('STATE_RESTORED', req.authUser.id);
+    res.json({ ok: true, version: serverState.version, usersCount: serverState.users.length });
   });
 
   app.post('/api/auth/login', (req, res) => {
@@ -571,6 +740,7 @@ async function startServer() {
     const adminOnlyActions = new Set([
       'USER_ADD',
       'USER_UPDATE',
+      'USER_DELETE',
       'CAMPAIGN_CREATE',
       'CAMPAIGN_UPDATE',
       'CAMPAIGN_DELETE',
@@ -797,10 +967,22 @@ async function startServer() {
         }
 
         case 'USER_ADD': {
+          const emailLower = String(payload.email || '').trim().toLowerCase();
+          if (!emailLower || !String(payload.name || '').trim()) {
+            res.status(400).json({ error: 'Name and valid institutional email are required.' });
+            return;
+          }
+          if (serverState.users.some((u) => u.email && u.email.toLowerCase() === emailLower)) {
+            res.status(409).json({ error: `A staff account with email "${emailLower}" already exists.` });
+            return;
+          }
           const newUser = {
             id: payload.id || `user-${Date.now()}`,
             ...payload,
+            email: emailLower,
+            username: String(payload.username || emailLower).trim().toLowerCase(),
             status: payload.status || 'ACTIVE',
+            failed_logins: 0,
             created_at: payload.created_at || nowIso,
           };
           serverState.users.push(newUser);
@@ -823,17 +1005,73 @@ async function startServer() {
             res.status(404).json({ error: 'User not found' });
             return;
           }
-          serverState.users[idx] = { ...serverState.users[idx], ...(payload.partial || {}) };
+          const partial = { ...(payload.partial || {}) };
+          if (partial.email) {
+            const nextEmail = String(partial.email).trim().toLowerCase();
+            if (serverState.users.some((u) => u.id !== payload.id && u.email && u.email.toLowerCase() === nextEmail)) {
+              res.status(409).json({ error: `Another account already uses email "${nextEmail}".` });
+              return;
+            }
+            partial.email = nextEmail;
+          }
+          if (partial.password_hash) {
+            partial.failed_logins = 0;
+            partial.locked_until = undefined;
+            partial.password = undefined;
+          }
+          serverState.users[idx] = { ...serverState.users[idx], ...partial };
+          if (serverState.users[idx].status === 'INACTIVE') {
+            wsClients.forEach((client) => {
+              if (client.userId === payload.id) {
+                try { client.ws.close(4001, 'Account deactivated'); } catch {}
+              }
+            });
+          }
           appendAudit({
             user_name: user.name,
             user_role: user.role,
             action: 'SETTINGS_CHANGE',
             entity: 'User',
             entity_id: payload.id,
-            meta: { status: serverState.users[idx].status },
+            meta: { name: serverState.users[idx].name, status: serverState.users[idx].status, passwordChanged: Boolean(partial.password_hash) },
           });
           broadcastStateChanged(action, user.id, [payload.id]);
           res.json({ ok: true, version: serverState.version, user: sanitizeUserForClient(serverState.users[idx]) });
+          return;
+        }
+
+        case 'USER_DELETE': {
+          const targetId = payload.id;
+          if (!targetId) {
+            res.status(400).json({ error: 'User ID is required.' });
+            return;
+          }
+          if (targetId === user.id) {
+            res.status(400).json({ error: 'You cannot delete your own active administrator account.' });
+            return;
+          }
+          const targetIdx = serverState.users.findIndex((u) => u.id === targetId);
+          if (targetIdx === -1) {
+            res.status(404).json({ error: 'User not found' });
+            return;
+          }
+          const removed = serverState.users[targetIdx];
+          serverState.users.splice(targetIdx, 1);
+          wsClients.forEach((client) => {
+            if (client.userId === targetId) {
+              try { client.ws.close(4001, 'Account deleted'); } catch {}
+            }
+          });
+          appendAudit({
+            user_name: user.name,
+            user_role: user.role,
+            action: 'SETTINGS_CHANGE',
+            entity: 'User',
+            entity_id: targetId,
+            meta: { deletedName: removed.name, deletedEmail: removed.email },
+          });
+          broadcastStateChanged(action, user.id);
+          res.json({ ok: true, version: serverState.version });
           return;
         }
 

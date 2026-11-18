@@ -65,7 +65,10 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
   const [dailyCallGoal, setDailyCallGoal] = useState(60);
   const [mustChangePassword, setMustChangePassword] = useState(false);
   const [formError, setFormError] = useState('');
+  const [actionError, setActionError] = useState('');
   const [successToast, setSuccessToast] = useState('');
+  const [isSaving, setIsSaving] = useState(false);
+  const [confirmDeleteUserId, setConfirmDeleteUserId] = useState<string | null>(null);
 
   const refreshList = () => {
     setUsers([...crmDb.getUsers()]);
@@ -91,6 +94,7 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
     setDailyCallGoal(60);
     setMustChangePassword(true);
     setFormError('');
+    setActionError('');
     setIsModalOpen(true);
   };
 
@@ -106,10 +110,11 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
     setDailyCallGoal(user.daily_call_goal || 60);
     setMustChangePassword(user.must_change_password || false);
     setFormError('');
+    setActionError('');
     setIsModalOpen(true);
   };
 
-  const handleSaveUser = (e: React.FormEvent) => {
+  const handleSaveUser = async (e: React.FormEvent) => {
     e.preventDefault();
     setFormError('');
 
@@ -123,9 +128,10 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
       return;
     }
 
+    setIsSaving(true);
     try {
       if (editingUser) {
-        crmDb.updateUser(
+        await crmDb.updateUserAsync(
           editingUser.id,
           {
             name: name.trim(),
@@ -140,14 +146,19 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
           },
           currentUser
         );
-        showSuccess(`User ${name} updated successfully.`);
+        showSuccess(
+          password.trim()
+            ? `User ${name.trim()} and new password saved on server.`
+            : `User ${name.trim()} updated successfully.`
+        );
       } else {
         if (!password.trim()) {
           setFormError('Password is required for new user.');
+          setIsSaving(false);
           return;
         }
 
-        crmDb.addUser(
+        await crmDb.addUserAsync(
           {
             name: name.trim(),
             email: email.trim().toLowerCase(),
@@ -162,31 +173,56 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
           },
           currentUser
         );
-        showSuccess(`New ${role === 'SUPER_ADMIN' ? 'Administrator' : 'Academic Mentor'} created.`);
+        showSuccess(`New ${role === 'SUPER_ADMIN' ? 'Administrator' : 'Academic Mentor'} created and synced.`);
       }
 
       setIsModalOpen(false);
       refreshList();
     } catch (err: any) {
       setFormError(err.message || 'Operation failed.');
+    } finally {
+      setIsSaving(false);
     }
   };
 
-  const handleToggleStatus = (user: User) => {
+  const handleToggleStatus = async (user: User) => {
+    setActionError('');
     if (user.id === currentUser.id) {
-      setFormError('You cannot deactivate your own active administrator account.');
+      setActionError('You cannot deactivate your own active administrator account.');
       return;
     }
 
     const nextStatus = user.status === 'ACTIVE' ? 'INACTIVE' : 'ACTIVE';
-    crmDb.updateUser(user.id, { status: nextStatus }, currentUser);
-    showSuccess(`User account ${user.name} is now ${nextStatus}.`);
-    refreshList();
+    try {
+      await crmDb.updateUserAsync(user.id, { status: nextStatus }, currentUser);
+      showSuccess(`User account ${user.name} is now ${nextStatus}.`);
+      refreshList();
+    } catch (err: any) {
+      setActionError(err.message || 'Failed to update user status.');
+    }
+  };
+
+  const handleDeleteUser = async (user: User) => {
+    setActionError('');
+    if (user.id === currentUser.id) {
+      setActionError('You cannot delete your own active administrator account.');
+      setConfirmDeleteUserId(null);
+      return;
+    }
+    try {
+      await crmDb.deleteUserAsync(user.id, currentUser);
+      setConfirmDeleteUserId(null);
+      showSuccess(`User account ${user.name} permanently deleted.`);
+      refreshList();
+    } catch (err: any) {
+      setConfirmDeleteUserId(null);
+      setActionError(err.message || 'Failed to delete user.');
+    }
   };
 
   const showSuccess = (msg: string) => {
     setSuccessToast(msg);
-    setTimeout(() => setSuccessToast(''), 3500);
+    setTimeout(() => setSuccessToast(''), 4000);
   };
 
   // Filtered list
@@ -210,8 +246,23 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
       {/* Toast */}
       {successToast && (
         <div className="p-3.5 bg-emerald-50 border border-emerald-200 text-emerald-800 rounded-xl text-xs font-semibold flex items-center gap-2 shadow-2xs">
-          <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+          <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
           <span>{successToast}</span>
+        </div>
+      )}
+
+      {actionError && (
+        <div className="p-3.5 bg-rose-50 border border-rose-200 text-rose-800 rounded-xl text-xs font-semibold flex items-center justify-between gap-2 shadow-2xs">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+            <span>{actionError}</span>
+          </div>
+          <button
+            onClick={() => setActionError('')}
+            className="text-rose-600 hover:text-rose-800 font-bold px-1.5 cursor-pointer"
+          >
+            ✕
+          </button>
         </div>
       )}
 
@@ -355,13 +406,40 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
                           onClick={() => handleToggleStatus(u)}
                           className={`p-1.5 rounded cursor-pointer ${
                             u.status === 'ACTIVE'
-                              ? 'hover:bg-rose-50 text-rose-600'
+                              ? 'hover:bg-amber-50 text-amber-600'
                               : 'hover:bg-emerald-50 text-emerald-600'
                           }`}
                           title={u.status === 'ACTIVE' ? 'Deactivate staff member' : 'Reactivate staff member'}
                         >
                           {u.status === 'ACTIVE' ? <UserX className="w-3.5 h-3.5" /> : <UserCheck className="w-3.5 h-3.5" />}
                         </button>
+
+                        {u.id !== currentUser.id && (
+                          confirmDeleteUserId === u.id ? (
+                            <div className="inline-flex items-center gap-1 ml-1">
+                              <button
+                                onClick={() => handleDeleteUser(u)}
+                                className="px-2 py-0.5 bg-rose-600 hover:bg-rose-700 text-white rounded text-[10px] font-bold cursor-pointer"
+                              >
+                                Confirm
+                              </button>
+                              <button
+                                onClick={() => setConfirmDeleteUserId(null)}
+                                className="px-2 py-0.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded text-[10px] font-bold cursor-pointer"
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          ) : (
+                            <button
+                              onClick={() => setConfirmDeleteUserId(u.id)}
+                              className="p-1.5 hover:bg-rose-50 text-rose-600 rounded cursor-pointer"
+                              title="Permanently delete staff member"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          )
+                        )}
                       </div>
                     </td>
                   </tr>
@@ -539,9 +617,10 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
                 </button>
                 <button
                   type="submit"
-                  className="px-5 py-2 bg-slate-950 hover:bg-slate-800 text-white font-bold rounded-lg shadow-xs cursor-pointer"
+                  disabled={isSaving}
+                  className="px-5 py-2 bg-slate-950 hover:bg-slate-800 disabled:bg-slate-400 text-white font-bold rounded-lg shadow-xs cursor-pointer"
                 >
-                  {editingUser ? 'Save Changes' : 'Create User'}
+                  {isSaving ? 'Saving...' : editingUser ? 'Save Changes' : 'Create User'}
                 </button>
               </div>
             </form>

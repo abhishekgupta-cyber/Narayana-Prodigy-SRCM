@@ -510,7 +510,7 @@ export function parseExcelAttendanceMatrix(
 /**
  * Generates Downloadable Sample Templates (.xlsx)
  */
-export function generateSampleTemplate(type: 'ADMISSIONS' | 'EXAMS' | 'ATTENDANCE'): void {
+export function generateSampleTemplate(type: 'ADMISSIONS' | 'EXAMS' | 'ATTENDANCE' | 'LEADS'): void {
   const wb = XLSX.utils.book_new();
 
   if (type === 'ADMISSIONS') {
@@ -599,6 +599,26 @@ export function generateSampleTemplate(type: 'ADMISSIONS' | 'EXAMS' | 'ATTENDANC
     const ws = XLSX.utils.json_to_sheet(sampleData);
     XLSX.utils.book_append_sheet(wb, ws, 'Exam Results');
     XLSX.writeFile(wb, 'Narayana_Prodigy_Exam_Results_Template.xlsx');
+  } else if (type === 'LEADS') {
+    const sampleData = [
+      {
+        'Student Name': 'Rohan Malhotra',
+        'Mobile': '9876501234',
+        'City': 'Jaipur',
+        'Source': 'Scholarship Drive 2026',
+        'Notes': 'Interested in JEE 2-Year Classroom',
+      },
+      {
+        'Student Name': 'Ananya Joshi',
+        'Mobile': '9829011223',
+        'City': 'Udaipur',
+        'Source': 'Website Inquiry',
+        'Notes': 'Needs NEET Foundation brochure',
+      },
+    ];
+    const ws = XLSX.utils.json_to_sheet(sampleData);
+    XLSX.utils.book_append_sheet(wb, ws, 'External Leads');
+    XLSX.writeFile(wb, 'Narayana_Prodigy_External_Leads_Template.xlsx');
   } else {
     const sampleData = [
       {
@@ -630,6 +650,26 @@ export function generateSampleTemplate(type: 'ADMISSIONS' | 'EXAMS' | 'ATTENDANC
     XLSX.utils.book_append_sheet(wb, ws, 'Attendance Sheet');
     XLSX.writeFile(wb, 'Narayana_Prodigy_Attendance_Template.xlsx');
   }
+}
+
+export function exportCallingReportToExcel(calls: CallLog[], fileName?: string): void {
+  const wb = XLSX.utils.book_new();
+  const rows = calls.map((c) => ({
+    'Call Date (IST)': c.calendar_date,
+    'Mentor Name': c.mentor_name,
+    'Admission No': c.student_id,
+    'Disposition': c.disposition,
+    'Duration (sec)': c.call_duration_sec,
+    'Latency (sec)': c.latency_seconds,
+    'Suspicious Flag': c.is_suspicious ? 'YES' : 'NO',
+    'Campaign Outcome': c.campaign_outcome || '—',
+    'Remark': c.remark,
+    'Follow-up Date': c.follow_up_date || '—',
+  }));
+  const ws = XLSX.utils.json_to_sheet(rows.length > 0 ? rows : [{ Notice: 'No calls matched filter criteria' }]);
+  XLSX.utils.book_append_sheet(wb, ws, 'Calling Report');
+  const outName = fileName || `Narayana_Calling_Report_${getTodayCalendarDate()}`;
+  XLSX.writeFile(wb, outName.endsWith('.xlsx') ? outName : `${outName}.xlsx`);
 }
 
 /**

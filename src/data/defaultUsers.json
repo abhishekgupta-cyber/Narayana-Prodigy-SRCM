@@ -1,12 +1,21 @@
 [
   {
     "id": "admin-1",
-    "name": "Dr. Abhishek Gupta",
+    "name": "Abhishek Gupta",
     "email": "abhishekgupta@narayanagroup.com",
     "role": "SUPER_ADMIN",
     "department": "National Academic Operations & Relations",
     "daily_call_goal": 0,
     "mobile_number": "+91 99887 76655"
+  },
+  {
+    "id": "admin-himani",
+    "name": "Himani",
+    "email": "himani@narayanagroup.com",
+    "role": "SUPER_ADMIN",
+    "department": "National Academic Operations & Relations",
+    "daily_call_goal": 0,
+    "mobile_number": "+91 98765 43210"
   },
   {
     "id": "mentor-rohit-yogi-sir",
