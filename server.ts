@@ -2,6 +2,7 @@ import http from 'http';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
+import { execSync } from 'child_process';
 import express from 'express';
 import type { Request, Response, NextFunction } from 'express';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -1065,8 +1066,18 @@ async function startServer() {
   // ---------------------------------------------------------------------------
   const distDir = path.join(process.cwd(), 'dist');
   const distIndex = path.join(distDir, 'index.html');
+
+  if (!fs.existsSync(distIndex)) {
+    console.log('[Narayana CRM Server] dist/index.html not found. Building application...');
+    try {
+      execSync('npm run build', { stdio: 'inherit' });
+    } catch (e) {
+      console.warn('Auto-build failed:', e);
+    }
+  }
+
   const isTsxRuntime = process.argv.some((arg) => arg.includes('tsx')) || process.execArgv.some((arg) => arg.includes('tsx'));
-  const isProd = process.env.NODE_ENV === 'production' || (!isTsxRuntime && fs.existsSync(distIndex));
+  const isProd = process.env.NODE_ENV === 'production' || !isTsxRuntime || fs.existsSync(distIndex);
 
   if (!isProd) {
     const { createServer: createViteServer } = await import('vite');
