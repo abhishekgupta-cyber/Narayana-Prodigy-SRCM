@@ -10,6 +10,7 @@ import { Navbar } from './components/layout/Navbar';
 import { AdminDashboard } from './components/admin/AdminDashboard';
 import { MentorWorkstation } from './components/mentor/MentorWorkstation';
 import { PrismaSchemaModal } from './components/common/PrismaSchemaModal';
+import { TestRunnerModal } from './components/common/TestRunnerModal';
 import { LoginPage } from './components/auth/LoginPage';
 
 export default function App() {
@@ -38,6 +39,55 @@ export default function App() {
   });
 
   const [showPrismaModal, setShowPrismaModal] = useState<boolean>(false);
+  const [showTestRunnerModal, setShowTestRunnerModal] = useState<boolean>(false);
+
+  // Restore authoritative server session & subscribe to real-time sync updates
+  useEffect(() => {
+    let active = true;
+
+    const unsubscribe = crmDb.subscribe(() => {
+      if (!active) return;
+      setAllSessions([...crmDb.getSessions()]);
+      setActiveSession(crmDb.getActiveSession());
+      if (authenticatedUser && !crmDb.hasServerSession()) {
+        // Session invalidated (e.g. account deactivated by admin)
+        try {
+          localStorage.removeItem('narayana_crm_auth_session');
+        } catch {}
+        setAuthenticatedUser(null);
+      }
+    });
+
+    if (authenticatedUser) {
+      if (crmDb.hasServerSession()) {
+        void crmDb.restoreServerSession().then((serverUser) => {
+          if (!active) return;
+          if (!serverUser) {
+            try {
+              localStorage.removeItem('narayana_crm_auth_session');
+            } catch {}
+            setAuthenticatedUser(null);
+          } else {
+            setAuthenticatedUser(serverUser);
+            try {
+              localStorage.setItem('narayana_crm_auth_session', JSON.stringify(serverUser));
+            } catch {}
+          }
+        });
+      } else {
+        // Legacy local-only stored session without server token: require clean server sign-in
+        try {
+          localStorage.removeItem('narayana_crm_auth_session');
+        } catch {}
+        setAuthenticatedUser(null);
+      }
+    }
+
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, []);
 
   // Handle Session Change (Section 5)
   const handleSelectSession = (sessionId: string) => {
@@ -48,6 +98,8 @@ export default function App() {
   // Handle Login
   const handleLoginSuccess = (user: User) => {
     setAuthenticatedUser(user);
+    setAllSessions([...crmDb.getSessions()]);
+    setActiveSession(crmDb.getActiveSession());
     try {
       localStorage.setItem('narayana_crm_auth_session', JSON.stringify(user));
     } catch (e) {
@@ -63,9 +115,9 @@ export default function App() {
 
   // Handle Logout
   const handleLogout = () => {
+    crmDb.disconnectServerSync();
     try {
       localStorage.removeItem('narayana_crm_auth_session');
-      sessionStorage.removeItem('narayana_crm_impersonator');
     } catch (e) {
       console.warn('Failed to clear session:', e);
     }
@@ -89,6 +141,7 @@ export default function App() {
         allSessions={allSessions}
         onSelectSession={handleSelectSession}
         onOpenPrismaSchema={() => setShowPrismaModal(true)}
+        onOpenTestRunner={() => setShowTestRunnerModal(true)}
         onLogout={handleLogout}
       />
 
@@ -98,6 +151,7 @@ export default function App() {
           <AdminDashboard
             currentUser={authenticatedUser}
             initialTab={activeTab}
+            activeSessionId={activeSession.id}
             onTrackMentor={(mentorId) => {
               setActiveTab('reports');
             }}
@@ -105,6 +159,7 @@ export default function App() {
         ) : (
           <MentorWorkstation
             currentUser={authenticatedUser}
+            activeSessionId={activeSession.id}
             initialTab={
               activeTab === 'my-students'
                 ? 'my-students'
@@ -139,6 +194,13 @@ export default function App() {
               <>
                 <span>·</span>
                 <button
+                  onClick={() => setShowTestRunnerModal(true)}
+                  className="text-emerald-700 hover:underline font-semibold cursor-pointer"
+                >
+                  Verify Tests (T1-T23)
+                </button>
+                <span>·</span>
+                <button
                   onClick={() => setShowPrismaModal(true)}
                   className="text-amber-600 hover:underline font-semibold cursor-pointer"
                 >
@@ -153,6 +215,11 @@ export default function App() {
       {/* Prisma Schema Modal */}
       {showPrismaModal && (
         <PrismaSchemaModal onClose={() => setShowPrismaModal(false)} />
+      )}
+
+      {/* Acceptance Test Runner Modal */}
+      {showTestRunnerModal && (
+        <TestRunnerModal onClose={() => setShowTestRunnerModal(false)} />
       )}
     </div>
   );

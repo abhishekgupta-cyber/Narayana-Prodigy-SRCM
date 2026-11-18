@@ -47,6 +47,7 @@ import { AbsenteeismModal } from '../common/AbsenteeismModal';
 
 interface MentorWorkstationProps {
   currentUser: User;
+  activeSessionId?: string;
   initialTab?: 'assigned-calls' | 'my-students' | 'call-history';
 }
 
@@ -64,6 +65,7 @@ const DISPOSITIONS: { value: CallDisposition; label: string; color: string }[] =
 
 export const MentorWorkstation: React.FC<MentorWorkstationProps> = ({
   currentUser,
+  activeSessionId,
   initialTab = 'assigned-calls',
 }) => {
   // Navigation tabs (Section 6)
@@ -125,11 +127,13 @@ export const MentorWorkstation: React.FC<MentorWorkstationProps> = ({
   const [inboundNewRemark, setInboundNewRemark] = useState('');
   const [inboundFollowUpDate, setInboundFollowUpDate] = useState('');
   const [inboundClearFollowUp, setInboundClearFollowUp] = useState(false);
+  const [inboundError, setInboundError] = useState('');
 
   // Live IST Watermark & Blur-on-Unfocus (Section 12)
   const [isWindowBlurred, setIsWindowBlurred] = useState(false);
   const [watermarkTime, setWatermarkTime] = useState(formatISTDateTime(new Date()));
   const [toastMessage, setToastMessage] = useState('');
+  const [toastType, setToastType] = useState<'success' | 'error'>('success');
 
   // Load Workstation Data
   const loadData = () => {
@@ -155,7 +159,11 @@ export const MentorWorkstation: React.FC<MentorWorkstationProps> = ({
 
   useEffect(() => {
     loadData();
-  }, [currentUser.id, myStudentsPage, myStudentsLimit, myStudentsSearch]);
+    const unsubscribe = crmDb.subscribe(() => {
+      loadData();
+    });
+    return unsubscribe;
+  }, [currentUser.id, activeSessionId, myStudentsPage, myStudentsLimit, myStudentsSearch]);
 
   // Section 12: Non-Admin Security Deterrents (Watermark, Shortcut and Blur events)
   useEffect(() => {
@@ -192,13 +200,13 @@ export const MentorWorkstation: React.FC<MentorWorkstationProps> = ({
   }, []);
 
   // Handle Call Initiation (Section 9.1, 9.2, 9.3)
-  const handleInitiateCall = (
+  const handleInitiateCall = async (
     student: Student,
     task?: CampaignAssignment,
     contact: 'PRIMARY' | 'ALTERNATE' = 'PRIMARY'
   ) => {
     try {
-      const sessionData = crmDb.startCallSession({
+      const sessionData = await crmDb.startCallSessionFromServer({
         studentId: student.admission_no,
         mentorId: currentUser.id,
         mentorName: currentUser.name,
@@ -237,7 +245,7 @@ export const MentorWorkstation: React.FC<MentorWorkstationProps> = ({
         window.location.href = sessionData.dialLink;
       }
     } catch (err: any) {
-      alert(err.message || 'Failed to start call session');
+      showToast(err.message || 'Failed to start call session', 'error');
     }
   };
 
@@ -249,7 +257,7 @@ export const MentorWorkstation: React.FC<MentorWorkstationProps> = ({
     setUnmaskedAlternate('');
   };
 
-  // Submit Call Disposition (Section 9.2 & 9.7: Silent anti-cheat, no mentor alert!)
+  // Submit Call Disposition (Section 9.2 & 9.7: Silent latency logging, no mentor alert)
   const handleSubmitCall = (e: React.FormEvent) => {
     e.preventDefault();
     if (!activeCallingStudent) return;
@@ -294,9 +302,10 @@ export const MentorWorkstation: React.FC<MentorWorkstationProps> = ({
     if (!inboundCallToEdit) return;
 
     if (!inboundNewRemark.trim()) {
-      alert('Please enter details of the parent callback.');
+      setInboundError('Please enter details of the parent callback.');
       return;
     }
+    setInboundError('');
 
     try {
       crmDb.overrideInboundCallback({
@@ -312,11 +321,12 @@ export const MentorWorkstation: React.FC<MentorWorkstationProps> = ({
       showToast('Inbound callback updated successfully.');
       loadData();
     } catch (err: any) {
-      alert(err.message);
+      setInboundError(err.message || 'Failed to save callback update.');
     }
   };
 
-  const showToast = (msg: string) => {
+  const showToast = (msg: string, type: 'success' | 'error' = 'success') => {
+    setToastType(type);
     setToastMessage(msg);
     setTimeout(() => setToastMessage(''), 3500);
   };
@@ -339,7 +349,7 @@ export const MentorWorkstation: React.FC<MentorWorkstationProps> = ({
 
   return (
     <div
-      className={`min-h-screen bg-slate-50/70 py-6 px-4 sm:px-6 lg:px-8 space-y-6 select-none relative ${
+      className={`non-admin-protected print:hidden min-h-screen bg-slate-50/70 py-6 px-4 sm:px-6 lg:px-8 space-y-6 select-none relative ${
         isWindowBlurred ? 'filter blur-sm transition-all duration-300' : ''
       }`}
       onContextMenu={(e) => e.preventDefault()}
@@ -358,8 +368,18 @@ export const MentorWorkstation: React.FC<MentorWorkstationProps> = ({
 
       {/* TOAST MESSAGE */}
       {toastMessage && (
-        <div className="fixed bottom-6 right-6 z-50 bg-slate-900 text-white px-4 py-3 rounded-lg shadow-xl border border-slate-700 flex items-center gap-2.5 text-xs font-semibold">
-          <Check className="w-4 h-4 text-emerald-400" />
+        <div
+          className={`fixed bottom-6 right-6 z-50 px-4 py-3 rounded-lg shadow-xl border flex items-center gap-2.5 text-xs font-semibold ${
+            toastType === 'error'
+              ? 'bg-rose-950 text-white border-rose-700'
+              : 'bg-slate-900 text-white border-slate-700'
+          }`}
+        >
+          {toastType === 'error' ? (
+            <AlertCircle className="w-4 h-4 text-rose-400" />
+          ) : (
+            <Check className="w-4 h-4 text-emerald-400" />
+          )}
           <span>{toastMessage}</span>
         </div>
       )}
@@ -843,7 +863,7 @@ export const MentorWorkstation: React.FC<MentorWorkstationProps> = ({
               My Call History & Dispositions
             </h2>
             <p className="text-xs text-slate-500">
-              Chronological log of completed calls. Past remarks are concealed per Anti-Cheat Protocol.
+              Chronological log of your completed calls.
             </p>
           </div>
 
@@ -884,7 +904,7 @@ export const MentorWorkstation: React.FC<MentorWorkstationProps> = ({
                         {formatTimer(c.call_duration_sec)}
                       </td>
                       <td className="py-3 px-4 text-slate-800">
-                        {c.remark ? `"${c.remark}"` : <span className="text-slate-400 italic">Past remark concealed</span>}
+                        {c.remark ? `"${c.remark}"` : <span className="text-slate-400">—</span>}
                       </td>
                       <td className="py-3 px-4 font-mono text-slate-600">
                         {c.follow_up_date ? `${c.follow_up_date} (${c.follow_up_time || '10:00 AM'})` : '—'}
@@ -915,7 +935,7 @@ export const MentorWorkstation: React.FC<MentorWorkstationProps> = ({
                 </h3>
               </div>
 
-              {/* Neutral Live Timer (Section 9.3: Server-authoritative, no anti-cheat text!) */}
+              {/* Neutral Live Timer (Section 9.3: Server-authoritative) */}
               <div className="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-lg border border-slate-800">
                 <Clock className="w-4 h-4 text-amber-400" />
                 <span className="font-mono text-base font-bold text-amber-300">
@@ -976,25 +996,25 @@ export const MentorWorkstation: React.FC<MentorWorkstationProps> = ({
                   <div className="bg-white p-2 rounded border border-slate-200">
                     <span className="text-[10px] text-slate-400 block">ATTENDANCE</span>
                     <span className="font-bold text-slate-900 text-sm">
-                      {studentAttendance ? `${studentAttendance.overallPercentage}%` : '85%'}
+                      {studentAttendance ? `${studentAttendance.overallPercentage}%` : '—'}
                     </span>
                   </div>
                   <div className="bg-white p-2 rounded border border-slate-200">
                     <span className="text-[10px] text-slate-400 block">CLASSES</span>
                     <span className="font-bold text-slate-900 text-sm">
-                      {studentAttendance ? `${studentAttendance.presentClasses}/${studentAttendance.totalClasses}` : '18/20'}
+                      {studentAttendance ? `${studentAttendance.presentClasses}/${studentAttendance.totalClasses}` : '—'}
                     </span>
                   </div>
                   <div className="bg-white p-2 rounded border border-slate-200">
                     <span className="text-[10px] text-slate-400 block">LATEST TEST</span>
                     <span className="font-bold text-slate-900 text-sm">
-                      {studentExam ? `${studentExam.percentage}%` : '78.5%'}
+                      {studentExam ? `${studentExam.percentage}%` : '—'}
                     </span>
                   </div>
                   <div className="bg-white p-2 rounded border border-slate-200">
                     <span className="text-[10px] text-slate-400 block">RANK</span>
                     <span className="font-bold text-slate-900 text-sm">
-                      {studentExam?.rank ? `#${studentExam.rank}` : '#4'}
+                      {studentExam?.rank ? `#${studentExam.rank}` : '—'}
                     </span>
                   </div>
                 </div>
@@ -1050,7 +1070,7 @@ export const MentorWorkstation: React.FC<MentorWorkstationProps> = ({
                   <textarea
                     rows={3}
                     required
-                    placeholder="Enter factual summary of discussion with parent (always blank on open per Section 9.6)..."
+                    placeholder="Enter factual summary of discussion with parent..."
                     value={modalRemark}
                     onChange={(e) => setModalRemark(e.target.value)}
                     className="w-full text-xs border border-slate-300 rounded-lg p-3 focus:outline-none focus:ring-2 focus:ring-amber-500 placeholder:text-slate-400"
@@ -1130,6 +1150,11 @@ export const MentorWorkstation: React.FC<MentorWorkstationProps> = ({
             </div>
 
             <form onSubmit={handleSaveInboundOverride} className="p-5 space-y-4 text-xs">
+              {inboundError && (
+                <div className="p-2.5 bg-rose-50 border border-rose-200 text-rose-800 rounded-lg text-xs font-semibold">
+                  {inboundError}
+                </div>
+              )}
               <div className="bg-slate-50 p-3 rounded-lg border border-slate-200 text-slate-700">
                 <span className="font-bold block text-[11px] text-slate-500">ORIGINAL LOG TODAY:</span>
                 <div>Disposition: <strong>{inboundCallToEdit.original_disposition || inboundCallToEdit.disposition}</strong></div>

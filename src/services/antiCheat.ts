@@ -84,20 +84,70 @@ export function formatPhoneNumber(phone: string, _isMobileViewport: boolean = fa
 }
 
 /**
+ * Universal Section 10.3 Index Range String Parser:
+ * Parses ranges like "1-50", "60-90", "1-10, 15, 20-25" (1-indexed)
+ * and returns zero-indexed array of indices capped at totalCount.
+ */
+export function parseIndexRangeString(rangeStr: string, totalCount: number): number[] {
+  if (!rangeStr || !rangeStr.trim()) return [];
+  const indices = new Set<number>();
+  const parts = rangeStr.split(',');
+
+  for (const part of parts) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+
+    if (trimmed.includes('-')) {
+      const [startStr, endStr] = trimmed.split('-');
+      const start = parseInt(startStr.trim(), 10);
+      const end = parseInt(endStr.trim(), 10);
+      if (!isNaN(start) && !isNaN(end)) {
+        const minVal = Math.max(1, Math.min(start, end));
+        const maxVal = Math.min(totalCount, Math.max(start, end));
+        for (let i = minVal; i <= maxVal; i++) {
+          indices.add(i - 1);
+        }
+      }
+    } else {
+      const single = parseInt(trimmed, 10);
+      if (!isNaN(single) && single >= 1 && single <= totalCount) {
+        indices.add(single - 1);
+      }
+    }
+  }
+
+  return Array.from(indices).sort((a, b) => a - b);
+}
+
+/**
  * Stealth Anti-Cheat Latency Evaluator (Section 9.7):
  * Silently stores latency_seconds and is_suspicious_submission = TRUE on server
  * if Connected and latency < suspicious_seconds (default 15).
  * No mentor-facing UI or API response may ever reveal this flag or anti-cheat warnings!
  */
 export function auditCallSubmission(
-  initiatedAt: string,
-  submittedAt: string,
-  disposition: CallDisposition,
-  thresholdSeconds: number = 15
+  arg1: string | number,
+  arg2?: string | number | CallDisposition,
+  arg3?: CallDisposition | number,
+  arg4?: number
 ): { latencySeconds: number; isSuspicious: boolean; reason?: string } {
-  const initTime = new Date(initiatedAt).getTime();
-  const subTime = new Date(submittedAt).getTime();
-  const latencySeconds = Math.max(0, Math.round((subTime - initTime) / 1000));
+  let latencySeconds = 0;
+  let disposition: CallDisposition = 'CONNECTED';
+  let thresholdSeconds = 15;
+
+  if (typeof arg1 === 'number' && typeof arg2 === 'string') {
+    // Called as auditCallSubmission(durationInSeconds, disposition, thresholdSeconds)
+    latencySeconds = Math.max(0, Math.round(arg1));
+    disposition = arg2 as CallDisposition;
+    thresholdSeconds = typeof arg3 === 'number' ? arg3 : 15;
+  } else if (typeof arg1 === 'string' && typeof arg2 === 'string') {
+    // Called as auditCallSubmission(initiatedAt, submittedAt, disposition, thresholdSeconds)
+    const initTime = new Date(arg1).getTime();
+    const subTime = new Date(arg2).getTime();
+    latencySeconds = Math.max(0, Math.round((subTime - initTime) / 1000));
+    disposition = (arg3 as CallDisposition) || 'CONNECTED';
+    thresholdSeconds = typeof arg4 === 'number' ? arg4 : 15;
+  }
 
   let isSuspicious = false;
   let reason: string | undefined = undefined;
@@ -114,10 +164,13 @@ export function auditCallSubmission(
  * Checks if a call log can still be edited via Same-Day Inbound Callback Override (Section 9.5).
  * Window is valid until 11:59:59 PM IST of the call's day.
  */
-export function canOverrideInboundToday(callLog: CallLog): boolean {
-  if (callLog.is_locked) return false;
+export function canOverrideInboundToday(target: CallLog | string): boolean {
   const todayIST = getTodayCalendarDate();
-  return callLog.calendar_date === todayIST;
+  if (typeof target === 'string') {
+    return target === todayIST;
+  }
+  if (target.is_locked) return false;
+  return target.calendar_date === todayIST;
 }
 
 /**
@@ -126,10 +179,31 @@ export function canOverrideInboundToday(callLog: CallLog): boolean {
  * No remarks from earlier days, other mentors, or admin are ever exposed.
  */
 export function getSanitizedRemarkForUser(
-  callLog: CallLog,
-  currentUserId: string,
-  currentUserRole: Role
-): { remark: string; isConcealed: boolean } {
+  arg1: CallLog | string,
+  arg2?: string,
+  arg3?: Role | string,
+  arg4?: string,
+  arg5?: string
+): any {
+  if (typeof arg1 === 'string') {
+    // Signature: (remarkText, authorId, currentUserId, callDate, todayDate)
+    const remarkText = arg1;
+    const authorId = arg2;
+    const currentUserId = arg3 as string;
+    const callDate = arg4;
+    const todayDate = arg5 || getTodayCalendarDate();
+
+    if (authorId === currentUserId && callDate === todayDate) {
+      return remarkText;
+    }
+    return '';
+  }
+
+  // Signature: (callLog, currentUserId, currentUserRole)
+  const callLog = arg1 as CallLog;
+  const currentUserId = arg2 as string;
+  const currentUserRole = arg3 as Role;
+
   if (currentUserRole === 'SUPER_ADMIN') {
     return { remark: callLog.remark || '', isConcealed: false };
   }

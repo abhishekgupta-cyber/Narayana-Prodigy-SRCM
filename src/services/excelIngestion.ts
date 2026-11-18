@@ -321,12 +321,26 @@ export async function parseAttendance(file: File): Promise<IngestionResult<Atten
  * 2. Per-Subject Count: Present / Total (e.g. Physics: 18/20)
  * 3. Absenteeism Audit List
  */
-export function aggregateAttendance(records: AttendanceRecord[]): AttendanceAggregation {
+export function aggregateAttendance(
+  records: AttendanceRecord[],
+  leaveRule: 'EXCLUDE' | 'COUNT_AS_ABSENT' | 'COUNT_AS_PRESENT' = 'EXCLUDE'
+): AttendanceAggregation & {
+  present: number;
+  absent: number;
+  leave: number;
+  recorded: number;
+  percentage: number;
+} {
   if (!records || records.length === 0) {
     return {
       totalClasses: 0,
       presentClasses: 0,
       overallPercentage: 100,
+      present: 0,
+      absent: 0,
+      leave: 0,
+      recorded: 0,
+      percentage: 100,
       subjectCounts: {},
       absenteeDetails: [],
     };
@@ -334,20 +348,27 @@ export function aggregateAttendance(records: AttendanceRecord[]): AttendanceAggr
 
   let totalClasses = 0;
   let presentClasses = 0;
-  const subjectMap: Record<string, { present: number; total: number }> = {};
+  let leaveClasses = 0;
+  let absentClasses = 0;
+  const subjectMap: Record<string, { present: number; total: number; leave: number; absent: number }> = {};
   const absenteeDetails: AttendanceAggregation['absenteeDetails'] = [];
 
   records.forEach((r) => {
     totalClasses++;
     if (!subjectMap[r.subject]) {
-      subjectMap[r.subject] = { present: 0, total: 0 };
+      subjectMap[r.subject] = { present: 0, total: 0, leave: 0, absent: 0 };
     }
     subjectMap[r.subject].total++;
 
     if (r.status === 'P') {
       presentClasses++;
       subjectMap[r.subject].present++;
+    } else if (r.status === 'L') {
+      leaveClasses++;
+      subjectMap[r.subject].leave++;
     } else if (r.status === 'A') {
+      absentClasses++;
+      subjectMap[r.subject].absent++;
       absenteeDetails.push({
         date: r.date,
         time_slot: r.time_slot,
@@ -367,15 +388,123 @@ export function aggregateAttendance(records: AttendanceRecord[]): AttendanceAggr
     };
   });
 
-  const overallPercentage = totalClasses > 0 ? Math.round((presentClasses / totalClasses) * 100) : 100;
+  // Per Section 1 D11: Attendance % = Present / (Present + Absent) * 100
+  let effectiveDenominator = presentClasses + absentClasses;
+  let effectiveNumerator = presentClasses;
+
+  if (leaveRule === 'COUNT_AS_ABSENT') {
+    effectiveDenominator = presentClasses + absentClasses + leaveClasses;
+  } else if (leaveRule === 'COUNT_AS_PRESENT') {
+    effectiveDenominator = presentClasses + absentClasses + leaveClasses;
+    effectiveNumerator = presentClasses + leaveClasses;
+  }
+
+  const overallPct = effectiveDenominator > 0
+    ? Number(((effectiveNumerator / effectiveDenominator) * 100).toFixed(1))
+    : 100;
 
   return {
     totalClasses,
     presentClasses,
-    overallPercentage,
+    overallPercentage: Math.round(overallPct),
+    present: presentClasses,
+    absent: absentClasses,
+    leave: leaveClasses,
+    recorded: effectiveDenominator,
+    percentage: overallPct,
     subjectCounts,
     absenteeDetails,
   };
+}
+
+/**
+ * Section 7.4 Matrix Attendance Parsing:
+ * Supports Matrix headers: [Admission No, Subject, "DD-MMM|HH:MM-HH:MM", ...]
+ * Infers year from academic session (e.g. '2026-27' -> months >= 4 take 2026, else 2027)
+ * Ignores blank cells (never Absent per D11)
+ * Parses P, A, L
+ */
+export function parseExcelAttendanceMatrix(
+  rows: any[],
+  batchId: string = 'batch-attendance',
+  sessionName: string = '2026-27',
+  existingStudents: Student[] = []
+): AttendanceRecord[] {
+  const records: AttendanceRecord[] = [];
+  const startYear = parseInt(sessionName.split('-')[0]) || 2026;
+  const endYear = startYear + 1;
+
+  const monthMap: Record<string, number> = {
+    jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6,
+    jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12,
+  };
+
+  rows.forEach((row) => {
+    const adm = String(row['Admission No'] || row['admission_no'] || '').trim();
+    if (!adm) return;
+
+    const defaultSubject = String(row['Subject'] || row['subject'] || 'Physics').trim();
+
+    Object.keys(row).forEach((colHeader) => {
+      const trimmedCol = colHeader.trim();
+      const lowerCol = trimmedCol.toLowerCase();
+      if (
+        lowerCol === 'admission no' ||
+        lowerCol === 'admission_no' ||
+        lowerCol === 'student name' ||
+        lowerCol === 'student_name' ||
+        lowerCol === 'subject'
+      ) {
+        return;
+      }
+
+      const rawVal = String(row[colHeader] || '').trim().toUpperCase();
+      // Per D11: Blank is NOT recorded, never absent
+      if (!rawVal) return;
+
+      let status: 'P' | 'A' | 'L' = 'P';
+      if (rawVal.startsWith('A')) status = 'A';
+      else if (rawVal.startsWith('L')) status = 'L';
+      else if (rawVal.startsWith('P')) status = 'P';
+      else return;
+
+      let datePart = trimmedCol;
+      let slotPart = '09:00 AM - 10:30 AM';
+      let subject = defaultSubject;
+
+      if (trimmedCol.includes('|')) {
+        const parts = trimmedCol.split('|');
+        datePart = parts[0].trim();
+        slotPart = parts[1].trim();
+      }
+
+      let parsedDate = datePart;
+      const dayMonthMatch = datePart.match(/^(\d{1,2})[-/ ]([A-Za-z]{3}|\d{1,2})([-/\d ]*)$/);
+      if (dayMonthMatch) {
+        const day = parseInt(dayMonthMatch[1]);
+        const mStr = dayMonthMatch[2].toLowerCase();
+        let month = monthMap[mStr] || parseInt(mStr);
+        if (!month || month < 1 || month > 12) month = 11;
+
+        let year = startYear;
+        if (month < 4) {
+          year = endYear;
+        }
+        parsedDate = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+      }
+
+      records.push({
+        id: `att-mat-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+        student_id: adm,
+        date: parsedDate,
+        time_slot: slotPart,
+        subject,
+        status,
+      });
+    });
+  });
+
+  return records;
 }
 
 /**

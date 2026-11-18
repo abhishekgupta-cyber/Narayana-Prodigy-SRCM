@@ -69,12 +69,14 @@ import { formatISTDateTime, getTodayCalendarDate, istDay } from '../../services/
 interface AdminDashboardProps {
   currentUser: User;
   initialTab?: string;
+  activeSessionId?: string;
   onTrackMentor?: (mentorId: string) => void;
 }
 
 export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   currentUser,
   initialTab = 'dashboard',
+  activeSessionId,
   onTrackMentor,
 }) => {
   const [activeTab, setActiveTab] = useState<string>(initialTab);
@@ -161,6 +163,16 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const [settings, setSettings] = useState(crmDb.getSettings());
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
 
+  // Inline Admin Notice & Two-Step Confirmation States (No window.alert / window.confirm)
+  const [adminNotice, setAdminNotice] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [confirmRollbackBatchId, setConfirmRollbackBatchId] = useState<string | null>(null);
+  const [confirmDeleteCampaignId, setConfirmDeleteCampaignId] = useState<string | null>(null);
+
+  const showAdminNotice = (text: string, type: 'success' | 'error' = 'success') => {
+    setAdminNotice({ text, type });
+    setTimeout(() => setAdminNotice(null), 4500);
+  };
+
   const refreshAll = () => {
     setAnalytics(crmDb.getAnalytics());
     setCampaigns(crmDb.getCampaigns());
@@ -192,8 +204,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
   useEffect(() => {
     refreshAll();
+    const unsubscribe = crmDb.subscribe(() => {
+      refreshAll();
+    });
+    return unsubscribe;
   }, [
     activeTab,
+    activeSessionId,
     directoryPage,
     directoryLimit,
     directorySearch,
@@ -226,22 +243,22 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         skippedAlreadyActive: res.skippedAlreadyActive,
       });
     } catch (err: any) {
-      alert(err.message || 'Invalid selection syntax.');
+      showAdminNotice(err.message || 'Invalid selection syntax.', 'error');
     }
   };
 
   // Section 10.3 Bulk Confirm
   const handleConfirmBulkAssignment = () => {
     if (!bulkSnapshotToken) {
-      alert('Please click "Preview Selection" first.');
+      showAdminNotice('Please click "Preview Selection" first.', 'error');
       return;
     }
     if (!selectedCampaignId) {
-      alert('Please select a target Campaign for this assignment.');
+      showAdminNotice('Please select a target Campaign for this assignment.', 'error');
       return;
     }
     if (bulkSelectedMentors.length === 0) {
-      alert('Please select at least one mentor to receive assignments.');
+      showAdminNotice('Please select at least one mentor to receive assignments.', 'error');
       return;
     }
 
@@ -260,7 +277,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       setTimeout(() => setBulkSuccessMsg(''), 5000);
       refreshAll();
     } catch (err: any) {
-      alert(err.message);
+      showAdminNotice(err.message || 'Bulk assignment failed.', 'error');
     }
   };
 
@@ -268,7 +285,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const handleCreateCampaign = (e: React.FormEvent) => {
     e.preventDefault();
     if (!newCampaignTitle.trim()) {
-      alert('Campaign title is required.');
+      showAdminNotice('Campaign title is required.', 'error');
       return;
     }
     const outcomesList = newCampaignOutcomes
@@ -287,19 +304,20 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
     setIsCreateCampaignOpen(false);
     setNewCampaignTitle('');
+    showAdminNotice('Campaign created successfully.');
     refreshAll();
   };
 
   // Rollback Upload Batch (Section 7.6)
   const handleRollbackBatch = (batchId: string) => {
-    if (window.confirm('Roll back this upload batch? Inserted records without active call logs will be reversed.')) {
-      try {
-        const res = crmDb.rollbackUploadBatch(batchId, currentUser);
-        alert(`Rollback complete. Reversed ${res.rolledBackCount} rows. Retained ${res.retainedCount} rows with call history.`);
-        refreshAll();
-      } catch (err: any) {
-        alert(err.message);
-      }
+    try {
+      const res = crmDb.rollbackUploadBatch(batchId, currentUser);
+      setConfirmRollbackBatchId(null);
+      showAdminNotice(`Rollback complete. Reversed ${res.rolledBackCount} rows. Retained ${res.retainedCount} rows with call history.`);
+      refreshAll();
+    } catch (err: any) {
+      setConfirmRollbackBatchId(null);
+      showAdminNotice(err.message || 'Rollback failed.', 'error');
     }
   };
 
@@ -309,6 +327,22 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
+      {adminNotice && (
+        <div
+          className={`fixed bottom-6 right-6 z-50 px-4 py-3 rounded-lg shadow-xl border flex items-center gap-2.5 text-xs font-semibold ${
+            adminNotice.type === 'error'
+              ? 'bg-rose-950 text-white border-rose-700'
+              : 'bg-slate-900 text-white border-slate-700'
+          }`}
+        >
+          {adminNotice.type === 'error' ? (
+            <AlertCircle className="w-4 h-4 text-rose-400" />
+          ) : (
+            <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+          )}
+          <span>{adminNotice.text}</span>
+        </div>
+      )}
       {/* ========================================================================= */}
       {/* 1. EXECUTIVE DASHBOARD (Section 6: Dense KPI Strip + Mentor Table)         */}
       {/* ========================================================================= */}
@@ -382,7 +416,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             <div className="bg-amber-50 border border-amber-200 rounded-xl p-3.5 flex items-start gap-3">
               <ShieldAlert className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
               <div>
-                <span className="text-xs font-bold text-amber-950 block">Stealth Anti-Cheat Audit</span>
+                <span className="text-xs font-bold text-amber-950 block">Fast-Submission Latency Audit</span>
                 <p className="text-[11px] text-amber-800 mt-0.5">
                   {analytics.suspiciousCallsCount} calls recorded with &lt;15s latency flagged for admin review.
                 </p>
@@ -777,12 +811,29 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                         <td className="py-3 px-4 font-mono font-bold">{b.total_rows}</td>
                         <td className="py-3 px-4 text-right">
                           {b.status !== 'ROLLED_BACK' && (
-                            <button
-                              onClick={() => handleRollbackBatch(b.id)}
-                              className="px-2.5 py-1 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 rounded font-bold text-[11px] cursor-pointer"
-                            >
-                              Rollback
-                            </button>
+                            confirmRollbackBatchId === b.id ? (
+                              <div className="inline-flex items-center gap-1.5">
+                                <button
+                                  onClick={() => handleRollbackBatch(b.id)}
+                                  className="px-2 py-1 bg-rose-600 hover:bg-rose-700 text-white rounded font-bold text-[11px] cursor-pointer"
+                                >
+                                  Confirm
+                                </button>
+                                <button
+                                  onClick={() => setConfirmRollbackBatchId(null)}
+                                  className="px-2 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded font-bold text-[11px] cursor-pointer"
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            ) : (
+                              <button
+                                onClick={() => setConfirmRollbackBatchId(b.id)}
+                                className="px-2.5 py-1 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 rounded font-bold text-[11px] cursor-pointer"
+                              >
+                                Rollback
+                              </button>
+                            )
                           )}
                         </td>
                       </tr>
@@ -1050,17 +1101,34 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                         </span>
                       </td>
                       <td className="py-3 px-4 text-right">
-                        <button
-                          onClick={() => {
-                            if (window.confirm(`Delete campaign "${c.title}"? Call history is preserved.`)) {
-                              crmDb.deleteCampaign(c.id, currentUser);
-                              refreshAll();
-                            }
-                          }}
-                          className="text-rose-600 hover:text-rose-800 font-bold cursor-pointer"
-                        >
-                          Delete
-                        </button>
+                        {confirmDeleteCampaignId === c.id ? (
+                          <div className="inline-flex items-center gap-1.5">
+                            <button
+                              onClick={() => {
+                                crmDb.deleteCampaign(c.id, currentUser);
+                                setConfirmDeleteCampaignId(null);
+                                showAdminNotice(`Campaign "${c.title}" archived. Call history preserved.`);
+                                refreshAll();
+                              }}
+                              className="px-2 py-0.5 bg-rose-600 hover:bg-rose-700 text-white rounded font-bold text-[11px] cursor-pointer"
+                            >
+                              Confirm Delete
+                            </button>
+                            <button
+                              onClick={() => setConfirmDeleteCampaignId(null)}
+                              className="px-2 py-0.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded font-bold text-[11px] cursor-pointer"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        ) : (
+                          <button
+                            onClick={() => setConfirmDeleteCampaignId(c.id)}
+                            className="text-rose-600 hover:text-rose-800 font-bold cursor-pointer"
+                          >
+                            Delete
+                          </button>
+                        )}
                       </td>
                     </tr>
                   ))}
@@ -1240,8 +1308,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               <button
                 disabled={selectedLeadIds.length === 0 || !leadTargetMentor}
                 onClick={() => {
+                  const count = selectedLeadIds.length;
                   crmDb.assignExternalLeads(selectedLeadIds, leadTargetMentor);
-                  alert(`Assigned ${selectedLeadIds.length} leads successfully.`);
+                  showAdminNotice(`Assigned ${count} leads successfully.`);
                   setSelectedLeadIds([]);
                   refreshAll();
                 }}
@@ -1362,7 +1431,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
               <div>
                 <label className="block text-slate-700 font-bold mb-1">
-                  Stealth Anti-Cheat Latency Threshold (Seconds)
+                  Instant Submission Latency Threshold (Seconds)
                 </label>
                 <input
                   type="number"

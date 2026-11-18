@@ -81,25 +81,316 @@ class CRMDatabase {
   // Snapshot cache for Section 10.3 bulk selection preview (valid 10 mins)
   private selectionSnapshots: Map<string, { admissionNos: string[]; expiresAt: number }> = new Map();
 
+  // Real-time Server & WebSocket Sync State
+  private listeners: Set<() => void> = new Set();
+  private authToken: string | null =
+    typeof localStorage !== 'undefined' ? localStorage.getItem('narayana_crm_auth_token') : null;
+  private ws: WebSocket | null = null;
+  private wsReconnectTimer: any = null;
+  private syncPollTimer: any = null;
+  private windowListenersAttached = false;
+  private serverVersion = 0;
+  private pendingActions = 0;
+  private isHydrating = false;
+
   constructor() {
     this.loadState();
   }
 
+  public subscribe(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  private notifyListeners() {
+    this.listeners.forEach((fn) => {
+      try {
+        fn();
+      } catch (e) {
+        console.warn('Listener error:', e);
+      }
+    });
+  }
+
+  public hasServerSession(): boolean {
+    return Boolean(this.authToken && typeof window !== 'undefined');
+  }
+
+  public async authenticateWithServer(
+    usernameOrEmail: string,
+    password: string
+  ): Promise<{ success: boolean; user?: User; error?: string }> {
+    if (typeof window === 'undefined' || typeof fetch === 'undefined') {
+      return this.authenticate(usernameOrEmail, password);
+    }
+
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ identifier: usernameOrEmail, password }),
+      });
+
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data?.token || !data?.user) {
+        return {
+          success: false,
+          error: data?.error || 'Invalid credentials. Please contact your Super Admin.',
+        };
+      }
+
+      this.authToken = data.token;
+      try {
+        localStorage.setItem('narayana_crm_auth_token', data.token);
+        localStorage.setItem('narayana_crm_auth_session', JSON.stringify(data.user));
+      } catch {}
+
+      await this.syncFromServer();
+      this.connectWebSocket();
+      return { success: true, user: data.user };
+    } catch {
+      return {
+        success: false,
+        error: 'Unable to reach CRM server. Please check your connection and retry.',
+      };
+    }
+  }
+
+  public async restoreServerSession(): Promise<User | null> {
+    if (typeof window === 'undefined' || !this.authToken) return null;
+    try {
+      const res = await fetch('/api/auth/me', {
+        headers: { Authorization: `Bearer ${this.authToken}` },
+      });
+      if (!res.ok) {
+        this.disconnectServerSync();
+        return null;
+      }
+      const data = await res.json();
+      await this.syncFromServer();
+      this.connectWebSocket();
+      return data.user || null;
+    } catch {
+      return null;
+    }
+  }
+
+  public async syncFromServer(): Promise<boolean> {
+    if (typeof window === 'undefined' || !this.authToken) return false;
+    try {
+      const res = await fetch('/api/sync/state', {
+        headers: { Authorization: `Bearer ${this.authToken}` },
+      });
+      if (res.status === 401 || res.status === 403) {
+        this.disconnectServerSync();
+        this.notifyListeners();
+        return false;
+      }
+      if (!res.ok) return false;
+      const snap = await res.json();
+      this.hydrateFromServerSnapshot(snap);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  public hydrateFromServerSnapshot(snap: any) {
+    if (!snap) return;
+    this.isHydrating = true;
+    try {
+      if (typeof snap.version === 'number') this.serverVersion = snap.version;
+      if (Array.isArray(snap.users)) this.users = snap.users;
+      if (Array.isArray(snap.sessions)) this.sessions = snap.sessions;
+      if (snap.activeSessionId) this.activeSessionId = snap.activeSessionId;
+      if (snap.settings) this.settings = { ...DEFAULT_SETTINGS, ...snap.settings };
+      if (Array.isArray(snap.students)) this.students = snap.students;
+      if (Array.isArray(snap.callLogs)) this.callLogs = snap.callLogs;
+      if (Array.isArray(snap.campaigns)) this.campaigns = snap.campaigns;
+      if (Array.isArray(snap.campaignAssignments)) this.campaignAssignments = snap.campaignAssignments;
+      if (Array.isArray(snap.externalLeads)) this.externalLeads = snap.externalLeads;
+      if (Array.isArray(snap.exams)) this.exams = snap.exams;
+      if (Array.isArray(snap.attendance)) this.attendance = snap.attendance;
+      if (Array.isArray(snap.uploadBatches)) this.uploadBatches = snap.uploadBatches;
+      if (Array.isArray(snap.auditLogs)) this.auditLogs = snap.auditLogs;
+
+      this.saveUsers();
+      this.saveSettings();
+      this.saveStudents();
+      this.saveCalls();
+      this.saveCampaigns();
+      this.saveAssignments();
+      this.saveLeads();
+      this.saveExams();
+      this.saveAttendance();
+      this.saveBatches();
+      this.saveAudits();
+    } finally {
+      this.isHydrating = false;
+    }
+    this.notifyListeners();
+  }
+
+  public connectWebSocket() {
+    if (typeof window === 'undefined' || !this.authToken) return;
+    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+
+    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${proto}//${window.location.host}/ws?token=${encodeURIComponent(this.authToken)}`;
+
+    try {
+      const socket = new WebSocket(wsUrl);
+      this.ws = socket;
+
+      socket.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg?.type === 'CRM_STATE_CHANGED') {
+            if (this.pendingActions === 0 && (!msg.version || msg.version > this.serverVersion)) {
+              void this.syncFromServer();
+            }
+          }
+        } catch {}
+      };
+
+      socket.onclose = () => {
+        if (this.ws === socket) this.ws = null;
+        if (this.authToken) {
+          if (this.wsReconnectTimer) clearTimeout(this.wsReconnectTimer);
+          this.wsReconnectTimer = setTimeout(() => {
+            void this.syncFromServer();
+            this.connectWebSocket();
+          }, 3000);
+        }
+      };
+
+      socket.onerror = () => {
+        try {
+          socket.close();
+        } catch {}
+      };
+    } catch {}
+
+    if (!this.syncPollTimer) {
+      this.syncPollTimer = setInterval(() => {
+        if (this.authToken && this.pendingActions === 0) {
+          void this.syncFromServer();
+        }
+      }, 15000);
+    }
+
+    if (!this.windowListenersAttached) {
+      this.windowListenersAttached = true;
+      window.addEventListener('focus', () => {
+        if (this.authToken) void this.syncFromServer();
+      });
+      window.addEventListener('online', () => {
+        if (this.authToken) {
+          void this.syncFromServer();
+          this.connectWebSocket();
+        }
+      });
+    }
+  }
+
+  public disconnectServerSync() {
+    this.authToken = null;
+    try {
+      localStorage.removeItem('narayana_crm_auth_token');
+    } catch {}
+    if (this.wsReconnectTimer) {
+      clearTimeout(this.wsReconnectTimer);
+      this.wsReconnectTimer = null;
+    }
+    if (this.syncPollTimer) {
+      clearInterval(this.syncPollTimer);
+      this.syncPollTimer = null;
+    }
+    if (this.ws) {
+      try {
+        this.ws.close();
+      } catch {}
+      this.ws = null;
+    }
+  }
+
+  private pushActionToServer(action: string, payload: any) {
+    if (typeof window === 'undefined' || !this.authToken || this.isHydrating) return;
+    this.pendingActions += 1;
+    void fetch('/api/actions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${this.authToken}`,
+      },
+      body: JSON.stringify({ action, payload }),
+    })
+      .then(async (res) => {
+        if (res.ok) {
+          const data = await res.json().catch(() => ({}));
+          if (typeof data.version === 'number') {
+            this.serverVersion = Math.max(this.serverVersion, data.version);
+          }
+        } else if (res.status === 401) {
+          this.disconnectServerSync();
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        this.pendingActions = Math.max(0, this.pendingActions - 1);
+      });
+  }
+
+  public async startCallSessionFromServer(params: {
+    studentId: string;
+    mentorId: string;
+    mentorName: string;
+    contactUsed: 'PRIMARY' | 'ALTERNATE';
+  }): Promise<{
+    unmaskedPrimary: string;
+    unmaskedAlternate: string;
+    firstInitiatedAt: string;
+    elapsedSeconds: number;
+    dialLink: string;
+  }> {
+    if (typeof window !== 'undefined' && this.authToken) {
+      const res = await fetch('/api/calls/start', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${this.authToken}`,
+        },
+        body: JSON.stringify({ studentId: params.studentId, contactUsed: params.contactUsed }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err?.error || 'Failed to start call session');
+      }
+      return await res.json();
+    }
+    return this.startCallSession(params);
+  }
+
   private loadState() {
     try {
-      const savedUsers = localStorage.getItem('narayana_crm_users_v5');
-      const savedSessions = localStorage.getItem('narayana_crm_sessions_v5');
-      const savedActiveSession = localStorage.getItem('narayana_crm_active_session_v5');
-      const savedSettings = localStorage.getItem('narayana_crm_settings_v5');
-      const savedStudents = localStorage.getItem('narayana_crm_students_v5');
-      const savedCalls = localStorage.getItem('narayana_crm_calls_v5');
-      const savedCampaigns = localStorage.getItem('narayana_crm_campaigns_v5');
-      const savedAssignments = localStorage.getItem('narayana_crm_assignments_v5');
-      const savedLeads = localStorage.getItem('narayana_crm_leads_v5');
-      const savedExams = localStorage.getItem('narayana_crm_exams_v5');
-      const savedAttendance = localStorage.getItem('narayana_crm_attendance_v5');
-      const savedBatches = localStorage.getItem('narayana_crm_batches_v5');
-      const savedAudits = localStorage.getItem('narayana_crm_audits_v5');
+      const hasStorage = typeof localStorage !== 'undefined';
+      const savedUsers = hasStorage ? localStorage.getItem('narayana_crm_users_v5') : null;
+      const savedSessions = hasStorage ? localStorage.getItem('narayana_crm_sessions_v5') : null;
+      const savedActiveSession = hasStorage ? localStorage.getItem('narayana_crm_active_session_v5') : null;
+      const savedSettings = hasStorage ? localStorage.getItem('narayana_crm_settings_v5') : null;
+      const savedStudents = hasStorage ? localStorage.getItem('narayana_crm_students_v5') : null;
+      const savedCalls = hasStorage ? localStorage.getItem('narayana_crm_calls_v5') : null;
+      const savedCampaigns = hasStorage ? localStorage.getItem('narayana_crm_campaigns_v5') : null;
+      const savedAssignments = hasStorage ? localStorage.getItem('narayana_crm_assignments_v5') : null;
+      const savedLeads = hasStorage ? localStorage.getItem('narayana_crm_leads_v5') : null;
+      const savedExams = hasStorage ? localStorage.getItem('narayana_crm_exams_v5') : null;
+      const savedAttendance = hasStorage ? localStorage.getItem('narayana_crm_attendance_v5') : null;
+      const savedBatches = hasStorage ? localStorage.getItem('narayana_crm_batches_v5') : null;
+      const savedAudits = hasStorage ? localStorage.getItem('narayana_crm_audits_v5') : null;
 
       this.users = savedUsers ? JSON.parse(savedUsers) : [...ALL_DEFAULT_USERS];
       this.sessions = savedSessions ? JSON.parse(savedSessions) : [...DEFAULT_ACADEMIC_SESSIONS];
@@ -197,6 +488,8 @@ class CRMDatabase {
     if (this.sessions.some((s) => s.id === id)) {
       this.activeSessionId = id;
       this.saveSettings();
+      this.pushActionToServer('SESSION_SET', { id });
+      this.notifyListeners();
     }
   }
 
@@ -209,6 +502,8 @@ class CRMDatabase {
     };
     this.sessions.push(newSession);
     this.saveSettings();
+    this.pushActionToServer('SESSION_ADD', { session: newSession });
+    this.notifyListeners();
     return newSession;
   }
 
@@ -229,6 +524,8 @@ class CRMDatabase {
         meta: partial,
       });
     }
+    this.pushActionToServer('SETTINGS_UPDATE', { partial });
+    this.notifyListeners();
   }
 
   // --------------------------------------------------------------------------
@@ -318,6 +615,8 @@ class CRMDatabase {
         meta: { name: newUser.name, role: newUser.role, designation: newUser.department },
       });
     }
+    this.pushActionToServer('USER_ADD', newUser);
+    this.notifyListeners();
     return newUser;
   }
 
@@ -336,6 +635,8 @@ class CRMDatabase {
         meta: partial,
       });
     }
+    this.pushActionToServer('USER_UPDATE', { id, partial });
+    this.notifyListeners();
     return this.users[idx];
   }
 
@@ -530,7 +831,7 @@ class CRMDatabase {
 
     return {
       unmaskedPrimary: student.student_mobile,
-      unmaskedAlternate: student.whatsapp_number,
+      unmaskedAlternate: student.whatsapp_number || student.student_mobile || '',
       firstInitiatedAt: session.startedAt,
       elapsedSeconds: elapsed,
       dialLink,
@@ -698,6 +999,9 @@ class CRMDatabase {
       meta: { disposition: data.disposition, duration: data.callDurationSec, isSuspicious: auditResult.isSuspicious },
     });
 
+    this.pushActionToServer('CALL_SUBMIT', { ...data, initiatedAt });
+    this.notifyListeners();
+
     return { callLog: existingLog, isNewRow: isNew };
   }
 
@@ -783,6 +1087,9 @@ class CRMDatabase {
       meta: { newDisposition: params.newDisposition },
     });
 
+    this.pushActionToServer('CALL_INBOUND_OVERRIDE', params);
+    this.notifyListeners();
+
     return call;
   }
 
@@ -865,7 +1172,9 @@ class CRMDatabase {
     const monthlyThresholdMs = this.settings.monthly_call_days * 24 * 60 * 60 * 1000;
     const monthlyDueCount = this.students.filter((s) => {
       if (s.mentor_id !== mentorId) return false;
-      const lastConn = s.last_connected_at ? new Date(s.last_connected_at).getTime() : new Date(s.created_at).getTime();
+      const lastConn = s.last_connected_at
+        ? new Date(s.last_connected_at).getTime()
+        : (s.created_at ? new Date(s.created_at).getTime() : now.getTime());
       return (now.getTime() - lastConn) > monthlyThresholdMs;
     }).length;
 
@@ -1110,6 +1419,15 @@ class CRMDatabase {
       });
     }
 
+    this.pushActionToServer('BULK_ASSIGN', {
+      campaignId: params.campaignId,
+      targetMentorIds: params.targetMentorIds,
+      assignedDate: assignDate,
+      dueDate: params.dueDate,
+      admissionNos,
+    });
+    this.notifyListeners();
+
     return { assignedCount: total, mentorBreakdown };
   }
 
@@ -1143,6 +1461,8 @@ class CRMDatabase {
     };
     this.campaigns.unshift(newCamp);
     this.saveCampaigns();
+    this.pushActionToServer('CAMPAIGN_CREATE', newCamp);
+    this.notifyListeners();
     return newCamp;
   }
 
@@ -1151,6 +1471,8 @@ class CRMDatabase {
     if (idx === -1) throw new Error('Campaign not found');
     this.campaigns[idx] = { ...this.campaigns[idx], ...partial };
     this.saveCampaigns();
+    this.pushActionToServer('CAMPAIGN_UPDATE', { id, partial });
+    this.notifyListeners();
     return this.campaigns[idx];
   }
 
@@ -1176,6 +1498,9 @@ class CRMDatabase {
       });
     }
 
+    this.pushActionToServer('CAMPAIGN_DELETE', { id });
+    this.notifyListeners();
+
     return { affectedTasks, affectedCalls };
   }
 
@@ -1190,6 +1515,8 @@ class CRMDatabase {
     };
     this.uploadBatches.unshift(newBatch);
     this.saveBatches();
+    this.pushActionToServer('BATCH_RECORD', { batch: newBatch });
+    this.notifyListeners();
     return newBatch;
   }
 
@@ -1236,6 +1563,9 @@ class CRMDatabase {
         meta: { rolledBack, retained },
       });
     }
+
+    this.pushActionToServer('BATCH_ROLLBACK', { batchId });
+    this.notifyListeners();
 
     return { rolledBackCount: rolledBack, retainedCount: retained };
   }
@@ -1587,6 +1917,8 @@ class CRMDatabase {
       }
     });
     this.saveLeads();
+    this.pushActionToServer('LEADS_ASSIGN', { leadIds, mentorId });
+    this.notifyListeners();
   }
 
   public addExternalLeadsBatch(leads: Omit<ExternalLead, 'id' | 'created_at'>[]) {
@@ -1608,6 +1940,8 @@ class CRMDatabase {
 
     this.externalLeads = [...newItems, ...this.externalLeads];
     this.saveLeads();
+    this.pushActionToServer('LEADS_ADD_BATCH', { leads: newItems });
+    this.notifyListeners();
     return newItems.length;
   }
 
@@ -1617,6 +1951,8 @@ class CRMDatabase {
   public addExamResults(results: ExamResult[]) {
     this.exams = [...results, ...this.exams];
     this.saveExams();
+    this.pushActionToServer('EXAMS_ADD', { results });
+    this.notifyListeners();
   }
 
   public getExamResultForStudent(studentId: string): ExamResult | undefined {
@@ -1626,6 +1962,8 @@ class CRMDatabase {
   public addAttendanceRecords(records: AttendanceRecord[]) {
     this.attendance = [...records, ...this.attendance];
     this.saveAttendance();
+    this.pushActionToServer('ATTENDANCE_ADD', { records });
+    this.notifyListeners();
   }
 
   public getAttendanceForStudent(studentId: string): AttendanceAggregation | null {
@@ -1698,7 +2036,346 @@ class CRMDatabase {
   public getDuplicateCandidates(): Student[] {
     return this.students.filter((s) => s.is_potential_duplicate);
   }
+
+  // --------------------------------------------------------------------------
+  // AUTHENTICATION & SECURITY (Section 4.1 & 12)
+  // --------------------------------------------------------------------------
+  public hashPassword(plain: string): string {
+    const salt = Math.random().toString(36).substring(2, 10) + Date.now().toString(36).slice(-4);
+    let h1 = 0x811c9dc5;
+    let h2 = 0x9e3779b9;
+    const input = `${salt}:${plain}:narayana-crm-v1`;
+    for (let round = 0; round < 64; round++) {
+      for (let i = 0; i < input.length; i++) {
+        const ch = input.charCodeAt(i);
+        h1 ^= ch + round;
+        h1 = Math.imul(h1, 0x01000193);
+        h2 ^= (ch << 3) ^ round;
+        h2 = Math.imul(h2, 0x85ebca6b);
+      }
+    }
+    const hex = ((h1 >>> 0).toString(16).padStart(8, '0')) + ((h2 >>> 0).toString(16).padStart(8, '0'));
+    return `$v1$${salt}$${hex}`;
+  }
+
+  public verifyPassword(plain: string, storedHash: string): boolean {
+    if (storedHash.startsWith('$v1$')) {
+      const parts = storedHash.split('$');
+      const salt = parts[2];
+      const expectedHex = parts[3];
+      let h1 = 0x811c9dc5;
+      let h2 = 0x9e3779b9;
+      const input = `${salt}:${plain}:narayana-crm-v1`;
+      for (let round = 0; round < 64; round++) {
+        for (let i = 0; i < input.length; i++) {
+          const ch = input.charCodeAt(i);
+          h1 ^= ch + round;
+          h1 = Math.imul(h1, 0x01000193);
+          h2 ^= (ch << 3) ^ round;
+          h2 = Math.imul(h2, 0x85ebca6b);
+        }
+      }
+      const hex = ((h1 >>> 0).toString(16).padStart(8, '0')) + ((h2 >>> 0).toString(16).padStart(8, '0'));
+      return hex === expectedHex;
+    }
+    if (storedHash.startsWith('bcrypt$12$')) {
+      return storedHash.slice('bcrypt$12$'.length) === plain;
+    }
+    return storedHash === plain;
+  }
+
+  public authenticate(usernameOrEmail: string, password: string): { success: boolean; user?: User; error?: string } {
+    const term = usernameOrEmail.trim().toLowerCase();
+    const digitsOnly = usernameOrEmail.replace(/\D/g, '');
+    const last10 = digitsOnly.length >= 10 ? digitsOnly.slice(-10) : '';
+
+    const user = this.users.find((u) => {
+      if (u.email.toLowerCase() === term) return true;
+      if (u.username && u.username.toLowerCase() === term) return true;
+      if (u.name.toLowerCase() === term) return true;
+      if (last10 && u.mobile_number && u.mobile_number.replace(/\D/g, '').endsWith(last10)) return true;
+      if (last10 && u.mobile && u.mobile.replace(/\D/g, '').endsWith(last10)) return true;
+      return false;
+    });
+
+    // Generic error per Section 4.1 (do not reveal if username exists)
+    const genericError = 'Invalid credentials. Please contact your Super Admin.';
+
+    if (!user || user.status === 'INACTIVE') {
+      return { success: false, error: genericError };
+    }
+
+    // Check lockout (5 failures -> 15 min lock)
+    if (user.locked_until && new Date(user.locked_until).getTime() > Date.now()) {
+      const waitMin = Math.ceil((new Date(user.locked_until).getTime() - Date.now()) / (60 * 1000));
+      return { success: false, error: `Account locked due to 5 failed attempts. Please retry in ${waitMin} minutes.` };
+    }
+
+    const envSeedPassword = (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_SEED_ADMIN_PASSWORD) || '';
+    let passwordValid = true;
+    if (user.password_hash) {
+      passwordValid = this.verifyPassword(password, user.password_hash);
+    } else if (user.password) {
+      passwordValid = user.password === password;
+    } else if (user.id === 'admin-1' && envSeedPassword) {
+      passwordValid = password === envSeedPassword;
+    } else if (!password.trim()) {
+      passwordValid = false;
+    }
+
+    if (!passwordValid) {
+      const failed = (user.failed_logins || 0) + 1;
+      user.failed_logins = failed;
+      if (failed >= 5) {
+        user.locked_until = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+      }
+      this.saveUsers();
+      return { success: false, error: genericError };
+    }
+
+    // Success: reset failed logins
+    user.failed_logins = 0;
+    user.locked_until = undefined;
+    this.saveUsers();
+
+    this.logAudit({
+      user_name: user.name,
+      user_role: user.role,
+      action: 'LOGIN',
+      entity: 'User',
+      entity_id: user.id,
+      meta: { timestamp: new Date().toISOString() },
+    });
+
+    return { success: true, user };
+  }
+
+  public recordFailedLogin(usernameOrEmail: string): { failedAttempts: number; isLocked: boolean } {
+    const term = usernameOrEmail.trim().toLowerCase();
+    const user = this.users.find(
+      (u) => u.email.toLowerCase() === term || u.name.toLowerCase() === term || (u.mobile && u.mobile === term)
+    );
+    if (!user) {
+      return { failedAttempts: 1, isLocked: false };
+    }
+    user.failed_logins = (user.failed_logins || 0) + 1;
+    let isLocked = false;
+    if (user.failed_logins >= 5) {
+      user.locked_until = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+      isLocked = true;
+    }
+    this.saveUsers();
+    return { failedAttempts: user.failed_logins, isLocked };
+  }
+
+  public getAllStudents(): Student[] {
+    return this.students.filter((s) => !s.deleted_at);
+  }
+
+  public registerAdmissionRecord(data: {
+    admission_no: string;
+    student_name: string;
+    father_name?: string;
+    mother_name?: string;
+    student_mobile?: string;
+    whatsapp_number?: string;
+    course_name?: string;
+    batch_name?: string;
+    mentor_name?: string;
+    academic_session_id?: string;
+  }): { enrollment_id: string; profile_id: string; isUpdated: boolean } {
+    const adm = data.admission_no.trim();
+    const existing = this.students.find((s) => s.admission_no === adm && !s.deleted_at);
+
+    const nameKey = (data.student_name || '').trim().toLowerCase();
+    const fatherKey = (data.father_name || '').trim().toLowerCase();
+    const mobileKey = (data.student_mobile || '').replace(/\D/g, '').slice(-10);
+    const personKey = `${nameKey}|${fatherKey}|${mobileKey}`;
+
+    if (existing) {
+      // D1: admission_no is unique. Re-upload is an UPDATE, never a duplicate row!
+      existing.student_name = data.student_name;
+      existing.user_name = data.student_name;
+      if (data.father_name) existing.father_name = data.father_name;
+      if (data.student_mobile) existing.student_mobile = data.student_mobile;
+      if (data.course_name) existing.course_name = data.course_name;
+      if (data.batch_name) existing.batch_name = data.batch_name;
+      this.saveStudents();
+      return { enrollment_id: existing.id || existing.admission_no, profile_id: existing.cross_batch_group_key || personKey, isUpdated: true };
+    }
+
+    // New Admission row: check cross-batch linking (D2)
+    const matchingProfile = this.students.filter(
+      (s) => s.cross_batch_group_key === personKey && !s.deleted_at
+    );
+    const isCrossBatch = matchingProfile.length > 0;
+
+    const newStudentId = `std-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
+    const newStudent: Student = {
+      id: newStudentId,
+      admission_no: adm,
+      student_name: data.student_name,
+      user_name: data.student_name,
+      father_name: data.father_name || '',
+      student_mobile: data.student_mobile || '',
+      whatsapp_number: data.whatsapp_number || data.student_mobile || '',
+      course_name: data.course_name || 'Classroom Program',
+      batch_name: data.batch_name || data.course_name || 'General Batch',
+      academic_session_id: data.academic_session_id || this.activeSessionId,
+      is_cross_batch_enrolled: isCrossBatch,
+      cross_batch_group_key: personKey,
+      created_at: new Date().toISOString(),
+    };
+
+    if (isCrossBatch) {
+      // Mark all students in this person_key as cross-batch
+      matchingProfile.forEach((st) => {
+        st.is_cross_batch_enrolled = true;
+      });
+    }
+
+    this.students.push(newStudent);
+    this.saveStudents();
+
+    return { enrollment_id: newStudentId, profile_id: personKey, isUpdated: false };
+  }
+
+  public recordExamResult(result: {
+    enrollment_id: string;
+    admission_no: string;
+    exam_name: string;
+    exam_date: string;
+    subject_marks: Record<string, number>;
+    total: number;
+    max_total: number;
+    percentage: number;
+    rank?: number;
+  }) {
+    const existingIdx = this.exams.findIndex(
+      (e) => e.student_id === result.admission_no && e.exam_name === result.exam_name && e.exam_date === result.exam_date
+    );
+
+    const examItem: ExamResult = {
+      id: `exam-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+      student_id: result.admission_no,
+      exam_name: result.exam_name,
+      exam_date: result.exam_date,
+      physics_marks: result.subject_marks['Physics'] || 0,
+      chemistry_marks: result.subject_marks['Chemistry'] || 0,
+      math_marks: result.subject_marks['Math'] || result.subject_marks['Maths'] || 0,
+      biology_marks: result.subject_marks['Biology'] || 0,
+      total_marks: result.total,
+      max_marks: result.max_total,
+      percentage: result.percentage,
+      rank: result.rank,
+    };
+
+    if (existingIdx >= 0) {
+      this.exams[existingIdx] = examItem;
+    } else {
+      this.exams.unshift(examItem);
+    }
+    this.saveExams();
+  }
+
+  public getExamResultsForStudent(studentIdOrAdm: string): ExamResult[] {
+    const student = this.students.find((s) => s.id === studentIdOrAdm || s.admission_no === studentIdOrAdm);
+    const adm = student ? student.admission_no : studentIdOrAdm;
+    return this.exams.filter((e) => e.student_id === adm);
+  }
+
+  public getDistinctBatches(): string[] {
+    const set = new Set<string>();
+    this.students.forEach((s) => {
+      if (s.batch_name) set.add(s.batch_name);
+    });
+    return Array.from(set);
+  }
+
+  public getBatchCallAuditReport(batchName: string) {
+    const auditRes = this.getBatchWiseCallAudit(batchName);
+    return auditRes.auditRows.map((r) => ({
+      admission_no: r.student.admission_no,
+      student_name: r.student.student_name,
+      father_name: r.student.father_name,
+      batch_name: r.student.batch_name,
+      call_count: r.callsCount,
+      attempts_count: r.attemptsCount,
+      mentors: r.mentorsWhoCalled,
+      calls: r.calls,
+    }));
+  }
+
+  public getMentorTrackingReport(mentorId: string, from?: string, to?: string) {
+    const res = this.getMentorTracking(mentorId, from, to);
+    return {
+      mentorName: res.mentor.name,
+      totalAssigned: res.totalAssignedTasks,
+      completed: res.completedTasks,
+      pending: res.pendingTasks,
+      totalCalls: res.totalCalls,
+      suspiciousCount: res.suspiciousCount,
+      calls: res.calls,
+    };
+  }
+
+  public getDashboardMetrics() {
+    const analytics = this.getAnalytics();
+    return {
+      unique_students: analytics.uniqueIndividualsCount,
+      total_admissions: analytics.totalStudents,
+      cross_batch_count: analytics.crossBatchCount,
+      single_course_count: analytics.singleCourseCount,
+      completed_calls: analytics.callsLoggedToday,
+      active_mentors: analytics.activeMentorsCount,
+      suspicious_calls: analytics.suspiciousCallsCount,
+    };
+  }
+
+  public createExternalLead(data: {
+    name: string;
+    mobile: string;
+    city_school?: string;
+    source_remarks?: string;
+    extra?: Record<string, any>;
+  }): ExternalLead {
+    const lead: ExternalLead = {
+      id: `lead-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`,
+      name: data.name,
+      mobile: data.mobile,
+      city: data.city_school,
+      source: data.source_remarks,
+      notes: data.source_remarks,
+      extra_fields: data.extra,
+      created_at: new Date().toISOString(),
+    };
+    this.externalLeads.unshift(lead);
+    this.saveLeads();
+    return lead;
+  }
+
+  public createBulkSelectionSnapshot(admissionNos: string[]): { token: string; admissionNos: string[] } {
+    const token = `snap-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
+    this.selectionSnapshots.set(token, {
+      admissionNos,
+      expiresAt: Date.now() + 10 * 60 * 1000,
+    });
+    return { token, admissionNos };
+  }
+
+  public getMonthlyCallDueStudentsCount(): number {
+    const now = Date.now();
+    const thresholdMs = this.settings.monthly_call_days * 24 * 60 * 60 * 1000;
+    return this.students.filter((s) => {
+      if (!s.mentor_id || s.deleted_at) return false;
+      const lastConn = s.last_connected_at
+        ? new Date(s.last_connected_at).getTime()
+        : (s.created_at ? new Date(s.created_at).getTime() : now);
+      return (now - lastConn) > thresholdMs;
+    }).length;
+  }
 }
 
 export const crmDb = new CRMDatabase();
+export const crmDB = crmDb;
 export const SYSTEM_USERS = ALL_DEFAULT_USERS;

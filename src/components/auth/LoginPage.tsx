@@ -31,7 +31,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess }) => {
   const [failCount, setFailCount] = useState<number>(0);
   const [isLocked, setIsLocked] = useState<boolean>(false);
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
 
@@ -47,42 +47,28 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess }) => {
 
     setIsLoading(true);
 
-    setTimeout(() => {
-      const cleanIdent = identifier.trim().toLowerCase();
-      const cleanPhone = identifier.replace(/\D/g, '');
+    try {
+      const authRes = await crmDb.authenticateWithServer(identifier, password);
 
-      // Match by email, username, or normalized mobile
-      const matchedUser = crmDb.getUsers().find((u) => {
-        if (u.email.toLowerCase() === cleanIdent) return true;
-        if (u.username && u.username.toLowerCase() === cleanIdent) return true;
-        if (cleanPhone && u.mobile_number && u.mobile_number.replace(/\D/g, '').endsWith(cleanPhone.slice(-10))) return true;
-        return false;
-      });
-
-      // Strict Section 4.1: Generic error text, never reveal whether username exists!
-      if (!matchedUser || matchedUser.status === 'INACTIVE') {
+      if (!authRes.success || !authRes.user) {
         const nextFails = failCount + 1;
         setFailCount(nextFails);
         if (nextFails >= 5) {
           setIsLocked(true);
           setError('Security Lockout: Too many invalid attempts. Access locked for 15 minutes.');
         } else {
-          setError('Invalid credentials. Please verify your login details.');
+          setError(authRes.error || 'Invalid credentials. Please verify your login details.');
         }
         setIsLoading(false);
         return;
       }
 
-      // Check lockout status
-      if (matchedUser.locked_until && new Date(matchedUser.locked_until).getTime() > Date.now()) {
-        setError('This account is locked. Please contact your system administrator.');
-        setIsLoading(false);
-        return;
-      }
-
       setIsLoading(false);
-      onLoginSuccess(matchedUser);
-    }, 350);
+      onLoginSuccess(authRes.user);
+    } catch {
+      setError('Unable to reach CRM server. Please retry.');
+      setIsLoading(false);
+    }
   };
 
   return (

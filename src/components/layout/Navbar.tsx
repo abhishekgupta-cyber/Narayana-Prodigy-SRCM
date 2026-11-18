@@ -36,6 +36,7 @@ interface NavbarProps {
   allSessions: AcademicSession[];
   onSelectSession: (sessionId: string) => void;
   onOpenPrismaSchema: () => void;
+  onOpenTestRunner?: () => void;
   onLogout: () => void;
 }
 
@@ -47,6 +48,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   allSessions,
   onSelectSession,
   onOpenPrismaSchema,
+  onOpenTestRunner,
   onLogout,
 }) => {
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);
@@ -118,14 +120,25 @@ export const Navbar: React.FC<NavbarProps> = ({
             {/* Right: User Role Badge, Prisma Schema & Secure Sign Out */}
             <div className="flex items-center gap-2.5">
               {isAdmin && (
-                <button
-                  onClick={onOpenPrismaSchema}
-                  className="hidden lg:flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-white hover:bg-slate-50 text-xs font-semibold text-slate-700 border border-slate-300 transition-colors shadow-2xs cursor-pointer"
-                  title="View PostgreSQL Prisma Schema Specification"
-                >
-                  <FileCode2 className="w-3.5 h-3.5 text-blue-600" />
-                  <span>Prisma Schema</span>
-                </button>
+                <>
+                  <button
+                    onClick={onOpenTestRunner}
+                    className="hidden sm:flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-emerald-50 hover:bg-emerald-100 text-xs font-semibold text-emerald-900 border border-emerald-300 transition-colors shadow-2xs cursor-pointer"
+                    title="Run acceptance test suite (T1 - T23)"
+                  >
+                    <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
+                    <span>Run Tests (T1-T23)</span>
+                  </button>
+
+                  <button
+                    onClick={onOpenPrismaSchema}
+                    className="hidden lg:flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-white hover:bg-slate-50 text-xs font-semibold text-slate-700 border border-slate-300 transition-colors shadow-2xs cursor-pointer"
+                    title="View PostgreSQL Prisma Schema Specification"
+                  >
+                    <FileCode2 className="w-3.5 h-3.5 text-blue-600" />
+                    <span>Prisma Schema</span>
+                  </button>
+                </>
               )}
 
               {/* Logged in User Tag */}

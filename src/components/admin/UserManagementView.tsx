@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Users,
   UserPlus,
@@ -68,9 +68,16 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
   const [successToast, setSuccessToast] = useState('');
 
   const refreshList = () => {
-    setUsers(crmDb.getUsers());
+    setUsers([...crmDb.getUsers()]);
     onRefreshAll();
   };
+
+  useEffect(() => {
+    const unsubscribe = crmDb.subscribe(() => {
+      setUsers([...crmDb.getUsers()]);
+    });
+    return unsubscribe;
+  }, []);
 
   const handleOpenAdd = () => {
     setEditingUser(null);
@@ -129,7 +136,7 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
             mobile_number: mobileNumber.trim(),
             daily_call_goal: Number(dailyCallGoal),
             must_change_password: mustChangePassword,
-            ...(password.trim() ? { password_hash: `bcrypt$12$${password.trim()}` } : {}),
+            ...(password.trim() ? { password_hash: crmDb.hashPassword(password.trim()) } : {}),
           },
           currentUser
         );
@@ -151,7 +158,7 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
             daily_call_goal: Number(dailyCallGoal),
             status: 'ACTIVE',
             must_change_password: mustChangePassword,
-            password_hash: `bcrypt$12$${password.trim()}`,
+            password_hash: crmDb.hashPassword(password.trim()),
           },
           currentUser
         );
@@ -167,18 +174,14 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
 
   const handleToggleStatus = (user: User) => {
     if (user.id === currentUser.id) {
-      alert('You cannot deactivate your own active administrator account.');
+      setFormError('You cannot deactivate your own active administrator account.');
       return;
     }
 
     const nextStatus = user.status === 'ACTIVE' ? 'INACTIVE' : 'ACTIVE';
-    const actionLabel = nextStatus === 'ACTIVE' ? 'activate' : 'deactivate';
-
-    if (window.confirm(`Are you sure you want to ${actionLabel} ${user.name}?`)) {
-      crmDb.updateUser(user.id, { status: nextStatus }, currentUser);
-      showSuccess(`User account ${user.name} is now ${nextStatus}.`);
-      refreshList();
-    }
+    crmDb.updateUser(user.id, { status: nextStatus }, currentUser);
+    showSuccess(`User account ${user.name} is now ${nextStatus}.`);
+    refreshList();
   };
 
   const showSuccess = (msg: string) => {

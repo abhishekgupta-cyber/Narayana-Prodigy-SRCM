@@ -32,11 +32,13 @@ export interface User {
   name: string;
   email: string;
   username?: string;
+  password?: string;
   password_hash?: string;
   role: Role;
   department: string; // e.g. "Senior Academic Mentor", "Student Relation Officer"
   designation?: string;
   mobile_number?: string;
+  mobile?: string;
   daily_call_goal: number;
   status?: 'ACTIVE' | 'INACTIVE';
   must_change_password?: boolean;
@@ -68,32 +70,34 @@ export interface StudentProfile {
 
 // Master Enrollment Schema (maps to Student in previous code)
 export interface Student {
+  id?: string;
   admission_no: string;      // Unique Primary Key
-  academic_year: string;     // e.g., "2026-2027"
+  academic_year?: string;    // e.g., "2026-2027"
   academic_session_id?: string;
   profile_id?: string;
   user_name: string;         // Student Full Name
+  student_name?: string;     // Alias for user_name
   father_name: string;       // Father's Name
-  mother_name: string;       // Mother's Name
+  mother_name?: string;      // Mother's Name
   student_mobile: string;    // Primary Mobile (normalized 10 digits)
-  whatsapp_number: string;   // WhatsApp / Alternate
-  email: string;             // Email
-  gender: string;            // Gender
-  dob: string;               // Date of Birth (YYYY-MM-DD)
-  category: string;          // Category
-  address: string;           // Address
-  city: string;              // City
-  state_name: string;        // State
-  district_name: string;     // District
-  pin_code: string;          // PIN
+  whatsapp_number?: string;  // WhatsApp / Alternate
+  email?: string;            // Email
+  gender?: string;           // Gender
+  dob?: string;              // Date of Birth (YYYY-MM-DD)
+  category?: string;         // Category
+  address?: string;          // Address
+  city?: string;             // City
+  state_name?: string;       // State
+  district_name?: string;    // District
+  pin_code?: string;         // PIN
   course_name: string;       // Course Name
-  course_type: string;       // Course Type
-  course_group: string;      // Course Group
-  course_class: string;      // Class
+  course_type?: string;      // Course Type
+  course_group?: string;     // Course Group
+  course_class?: string;     // Class
   mentor_name?: string;      // Assigned Caller Name
   raw_mentor_name?: string;  // Unmapped mentor string from upload
   mentor_id?: string;        // Mentor User ID
-  course_category: string;   // Course Category
+  course_category?: string;  // Course Category
   batch_name: string;        // Derived from Course Name or mapped Batch column
   admission_date?: string;
   last_connected_at?: string;
@@ -110,10 +114,12 @@ export interface Student {
   cross_batch_group_key?: string;
   enrolled_batches_summary?: string;
   enrollment_status?: string;
-  created_at: string;
-  updated_at: string;
+  created_at?: string;
+  updated_at?: string;
 
   // Aggregates & Indicators
+  attendance_percentage?: number;
+  total_calls_count?: number;
   last_call_date?: string;
   last_call_disposition?: CallDisposition;
   call_status_today?: 'NEVER_CALLED' | 'CALLED_TODAY' | 'CALLED_YESTERDAY' | 'DUE_FOLLOWUP';
@@ -239,13 +245,15 @@ export interface ExternalLead {
   alternate_mobile?: string;
   city?: string;
   school?: string;
-  source_list: string;
+  source?: string;
+  source_list?: string;
   source_remarks?: string;
   assigned_to?: string;
-  status: 'NEW' | 'CONTACTED' | 'CONVERTED' | 'DROPPED';
+  status?: 'NEW' | 'CONTACTED' | 'CONVERTED' | 'DROPPED';
   notes?: string;
   possible_duplicate?: boolean;
   extra_json?: Record<string, any>;
+  extra_fields?: Record<string, any>;
   upload_batch_id?: string;
   created_at: string;
 }
