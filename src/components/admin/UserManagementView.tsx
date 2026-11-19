@@ -102,12 +102,12 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
     setEditingUser(user);
     setName(user.name);
     setEmail(user.email);
-    setUsername(user.username || '');
+    setUsername(user.username || user.email || '');
     setPassword(''); // Never prefilled per Section 4.2
     setRole(user.role);
     setDepartment(user.department || 'Senior Academic Mentor');
     setMobileNumber(user.mobile_number || '');
-    setDailyCallGoal(user.daily_call_goal || 60);
+    setDailyCallGoal(user.daily_call_goal ?? (user.role === 'SUPER_ADMIN' ? 0 : 60));
     setMustChangePassword(user.must_change_password || false);
     setFormError('');
     setActionError('');
@@ -128,6 +128,9 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
       return;
     }
 
+    const cleanEmail = email.trim().toLowerCase();
+    const cleanUsername = username.trim().toLowerCase() || cleanEmail;
+
     setIsSaving(true);
     try {
       if (editingUser) {
@@ -135,8 +138,8 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
           editingUser.id,
           {
             name: name.trim(),
-            email: email.trim().toLowerCase(),
-            username: username.trim().toLowerCase() || email.trim().toLowerCase(),
+            email: cleanEmail,
+            username: cleanUsername,
             role,
             department: department.trim(),
             mobile_number: mobileNumber.trim(),
@@ -148,8 +151,8 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
         );
         showSuccess(
           password.trim()
-            ? `User ${name.trim()} and new password saved on server.`
-            : `User ${name.trim()} updated successfully.`
+            ? `User ${name.trim()} (${role === 'SUPER_ADMIN' ? 'Admin' : 'Mentor'}) & new password saved.`
+            : `User ${name.trim()} (${role === 'SUPER_ADMIN' ? 'Admin' : 'Mentor'}) updated successfully.`
         );
       } else {
         if (!password.trim()) {
@@ -161,8 +164,8 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
         await crmDb.addUserAsync(
           {
             name: name.trim(),
-            email: email.trim().toLowerCase(),
-            username: username.trim().toLowerCase() || email.trim().toLowerCase(),
+            email: cleanEmail,
+            username: cleanUsername,
             role,
             department: department.trim(),
             mobile_number: mobileNumber.trim(),
@@ -234,6 +237,7 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
       return (
         u.name.toLowerCase().includes(q) ||
         u.email.toLowerCase().includes(q) ||
+        (u.username && u.username.toLowerCase().includes(q)) ||
         (u.department && u.department.toLowerCase().includes(q)) ||
         (u.mobile_number && u.mobile_number.includes(q))
       );
@@ -348,6 +352,9 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
                     <td className="py-3 px-4">
                       <div className="font-bold text-slate-900">{u.name}</div>
                       <div className="text-[11px] text-slate-500 font-mono">{u.email}</div>
+                      {u.username && u.username !== u.email && (
+                        <div className="text-[10px] text-amber-700 font-mono">ID: {u.username}</div>
+                      )}
                     </td>
                     <td className="py-3 px-4">
                       <span
@@ -499,7 +506,15 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
                   </label>
                   <select
                     value={role}
-                    onChange={(e) => setRole(e.target.value as Role)}
+                    onChange={(e) => {
+                      const nextRole = e.target.value as Role;
+                      setRole(nextRole);
+                      if (nextRole === 'SUPER_ADMIN') {
+                        setDailyCallGoal(0);
+                      } else if (dailyCallGoal === 0) {
+                        setDailyCallGoal(60);
+                      }
+                    }}
                     className="w-full border border-slate-300 rounded-lg px-3 py-2 text-xs bg-white focus:outline-none focus:ring-1 focus:ring-amber-500 font-bold"
                   >
                     <option value="MENTOR">Academic Mentor</option>
@@ -518,23 +533,43 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
                     required
                     placeholder="name@narayanagroup.com"
                     value={email}
-                    onChange={(e) => setEmail(e.target.value)}
+                    onChange={(e) => {
+                      const prevEmailLower = email.trim().toLowerCase();
+                      const nextVal = e.target.value;
+                      setEmail(nextVal);
+                      if (!username.trim() || username.trim().toLowerCase() === prevEmailLower) {
+                        setUsername(nextVal.trim().toLowerCase());
+                      }
+                    }}
                     className="w-full border border-slate-300 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-amber-500"
                   />
                 </div>
 
                 <div>
                   <label className="block text-xs font-bold text-slate-700 uppercase mb-1">
-                    Direct Mobile Number
+                    Login Username / Staff ID
                   </label>
                   <input
                     type="text"
-                    placeholder="+91 98765 43210"
-                    value={mobileNumber}
-                    onChange={(e) => setMobileNumber(e.target.value)}
-                    className="w-full border border-slate-300 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-amber-500"
+                    placeholder="Auto-filled from email or custom ID"
+                    value={username}
+                    onChange={(e) => setUsername(e.target.value)}
+                    className="w-full border border-slate-300 rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-amber-500"
                   />
                 </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-slate-700 uppercase mb-1">
+                  Direct Mobile Number
+                </label>
+                <input
+                  type="text"
+                  placeholder="+91 98765 43210"
+                  value={mobileNumber}
+                  onChange={(e) => setMobileNumber(e.target.value)}
+                  className="w-full border border-slate-300 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-amber-500"
+                />
               </div>
 
               {/* Designation with Free-text Suggestions (Section 4.2) */}

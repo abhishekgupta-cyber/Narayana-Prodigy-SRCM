@@ -222,7 +222,7 @@
     "role": "SUPER_ADMIN",
     "department": "National Academic Operations & Relations Head",
     "daily_call_goal": 0,
-    "mobile_number": "+91 9510545964"
+    "mobile_number": "+91 95105 45694"
   },
   {
     "id": "mentor-ashish-thorecha-sir",
@@ -236,17 +236,17 @@
   {
     "id": "admin-ashish-mishra-sir",
     "name": "Ashish Mishra Sir",
-    "email": "ashishmishra@narayanagroup.com",
-    "role": "MENTOR",
+    "email": "ashish.mishra@narayanagroup.com",
+    "role": "SUPER_ADMIN",
     "department": "National Academic Head",
-    "daily_call_goal": 60,
-    "mobile_number": "+91 9711295588"
+    "daily_call_goal": 0,
+    "mobile_number": "+91 77370 65449"
   },
   {
     "id": "mentor-akash-goyal-sir",
     "name": "Akash Goyal Sir",
     "email": "akash.goyal.sir@narayanagroup.com",
-    "role": "SUPER_ADMIN",
+    "role": "MENTOR",
     "department": "Prodigy Markiting & Operation",
     "daily_call_goal": 60,
     "mobile_number": "+91 9216413064"
@@ -270,3 +270,4 @@
     "mobile_number": "+91 9424176250"
   }
 ]
+ 

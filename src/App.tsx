@@ -70,9 +70,22 @@ export default function App() {
             latest.name !== prev.name ||
             latest.department !== prev.department ||
             latest.role !== prev.role ||
-            latest.email !== prev.email
+            latest.email !== prev.email ||
+            latest.username !== prev.username ||
+            latest.mobile_number !== prev.mobile_number
           ) {
-            const updated = { ...prev, name: latest.name, department: latest.department, role: latest.role, email: latest.email };
+            if (latest.role !== prev.role) {
+              setActiveTab(latest.role === 'SUPER_ADMIN' ? 'dashboard' : 'assigned-calls');
+            }
+            const updated = {
+              ...prev,
+              name: latest.name,
+              department: latest.department,
+              role: latest.role,
+              email: latest.email,
+              username: latest.username,
+              mobile_number: latest.mobile_number,
+            };
             try {
               localStorage.setItem('narayana_crm_auth_session', JSON.stringify(updated));
             } catch {}

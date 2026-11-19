@@ -378,7 +378,7 @@ class CRMDatabase {
     }
   }
 
-  public async getServerHealth(): Promise<{ ok: boolean; persistenceMode?: string; version?: number }> {
+  public async getServerHealth(): Promise<{ ok: boolean; appVersion?: string; persistenceMode?: string; version?: number }> {
     if (typeof window === 'undefined' || typeof fetch === 'undefined') return { ok: false };
     try {
       const res = await fetch('/api/health');
@@ -699,14 +699,18 @@ class CRMDatabase {
 
   public async addUserAsync(userData: Omit<User, 'id'>, adminUser?: User): Promise<User> {
     const emailLower = (userData.email || '').trim().toLowerCase();
+    const usernameLower = (userData.username || emailLower).trim().toLowerCase();
     if (emailLower && this.users.some((u) => u.email.toLowerCase() === emailLower)) {
       throw new Error(`A staff account with email "${emailLower}" already exists.`);
+    }
+    if (usernameLower && this.users.some((u) => u.username && u.username.toLowerCase() === usernameLower)) {
+      throw new Error(`A staff account with login ID "${usernameLower}" already exists.`);
     }
     const newUser: User = {
       id: `user-${Date.now()}`,
       ...userData,
       email: emailLower,
-      username: (userData.username || emailLower).trim().toLowerCase(),
+      username: usernameLower,
       status: userData.status || 'ACTIVE',
       failed_logins: 0,
       created_at: new Date().toISOString(),
@@ -717,7 +721,8 @@ class CRMDatabase {
       throw new Error(res.error || 'Failed to save new user on server.');
     }
 
-    this.users.push(newUser);
+    const savedUser = res.data?.user ? { ...newUser, ...res.data.user } : newUser;
+    this.users.push(savedUser);
     this.saveUsers();
     if (adminUser) {
       this.logAudit({
@@ -725,12 +730,12 @@ class CRMDatabase {
         user_role: adminUser.role,
         action: 'ASSIGNMENT',
         entity: 'User',
-        entity_id: newUser.id,
-        meta: { name: newUser.name, role: newUser.role, designation: newUser.department },
+        entity_id: savedUser.id,
+        meta: { name: savedUser.name, role: savedUser.role, designation: savedUser.department },
       });
     }
     this.notifyListeners();
-    return newUser;
+    return savedUser;
   }
 
   private syncActiveAuthSessionIfSelf(updatedUser: User) {
@@ -791,6 +796,13 @@ class CRMDatabase {
       }
       cleanPartial.email = nextEmail;
     }
+    if (cleanPartial.username !== undefined) {
+      const nextUsername = cleanPartial.username.trim().toLowerCase() || cleanPartial.email || this.users[idx].email;
+      if (nextUsername && this.users.some((u) => u.id !== id && u.username && u.username.toLowerCase() === nextUsername)) {
+        throw new Error(`Another account already uses login ID "${nextUsername}".`);
+      }
+      cleanPartial.username = nextUsername;
+    }
     if (cleanPartial.password_hash) {
       cleanPartial.failed_logins = 0;
       cleanPartial.locked_until = undefined;
@@ -802,7 +814,9 @@ class CRMDatabase {
       throw new Error(res.error || 'Failed to update user on server.');
     }
 
-    this.users[idx] = { ...this.users[idx], ...cleanPartial };
+    this.users[idx] = res.data?.user
+      ? { ...this.users[idx], ...cleanPartial, ...res.data.user }
+      : { ...this.users[idx], ...cleanPartial };
     this.saveUsers();
     this.syncActiveAuthSessionIfSelf(this.users[idx]);
     if (adminUser) {

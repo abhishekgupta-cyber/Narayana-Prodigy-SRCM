@@ -20,6 +20,7 @@ const SECRET_FILE = path.join(DATA_DIR, '.session-secret');
 const DEFAULT_USERS_FILE = path.join(process.cwd(), 'src', 'data', 'defaultUsers.json');
 const REAL_ADMISSIONS_FILE = path.join(process.cwd(), 'src', 'data', 'realAdmissions.json');
 const DATABASE_URL = process.env.DATABASE_URL?.trim() || '';
+const APP_VERSION = '2.0.0';
 
 // ---------------------------------------------------------------------------
 // IST Date & Security Helpers (matches src/services/antiCheat.ts & db.ts)
@@ -126,6 +127,7 @@ function verifyToken(token: string | undefined | null): { userId: string; role: 
 // ---------------------------------------------------------------------------
 interface ServerCRMState {
   version: number;
+  defaultUsersDigest?: string;
   users: any[];
   sessions: any[];
   activeSessionId: string;
@@ -235,7 +237,12 @@ function createSeedState(): ServerCRMState {
 
   return {
     version: 1,
-    users,
+    defaultUsersDigest: getDefaultUsersDigest() || undefined,
+    users: users.map((u) => ({
+      ...u,
+      email: String(u.email || '').trim().toLowerCase(),
+      username: String(u.username || u.email || '').trim().toLowerCase(),
+    })),
     sessions: [
       { id: 'session-2025-26', name: '2025-26', start_month: 4, is_active: false },
       { id: 'session-2026-27', name: '2026-27', start_month: 4, is_active: true },
@@ -292,6 +299,7 @@ function extractSectionPayload(state: ServerCRMState, section: StateSection): an
   if (section === 'meta') {
     return {
       version: state.version,
+      defaultUsersDigest: state.defaultUsersDigest,
       sessions: state.sessions,
       activeSessionId: state.activeSessionId,
       settings: state.settings,
@@ -303,6 +311,7 @@ function extractSectionPayload(state: ServerCRMState, section: StateSection): an
 function applySectionPayload(target: ServerCRMState, section: StateSection, payload: any) {
   if (section === 'meta' && payload && typeof payload === 'object') {
     if (typeof payload.version === 'number') target.version = payload.version;
+    if (typeof payload.defaultUsersDigest === 'string') target.defaultUsersDigest = payload.defaultUsersDigest;
     if (Array.isArray(payload.sessions)) target.sessions = payload.sessions;
     if (payload.activeSessionId) target.activeSessionId = payload.activeSessionId;
     if (payload.settings) target.settings = { ...target.settings, ...payload.settings };
@@ -346,28 +355,109 @@ function createPgPoolIfConfigured(): Pool | null {
   }
 }
 
-function syncDefaultUsersIntoState(state: ServerCRMState): boolean {
-  if (!fs.existsSync(DEFAULT_USERS_FILE)) return false;
+function getDefaultUsersDigest(): string | null {
+  if (!fs.existsSync(DEFAULT_USERS_FILE)) return null;
   try {
-    const defaultUsers: any[] = JSON.parse(fs.readFileSync(DEFAULT_USERS_FILE, 'utf8'));
-    let changed = false;
-
-    const abhishekDefault = defaultUsers.find((u) => u.id === 'admin-1');
-    const abhishekState = state.users.find((u) => u.id === 'admin-1');
-    if (abhishekDefault && abhishekState && abhishekState.name === 'Dr. Abhishek Gupta' && abhishekDefault.name !== 'Dr. Abhishek Gupta') {
-      abhishekState.name = abhishekDefault.name;
-      changed = true;
-    }
-
-    const himaniDefault = defaultUsers.find((u) => u.id === 'admin-himani');
-    if (himaniDefault && !state.users.some((u) => u.id === 'admin-himani' || (u.email && u.email.toLowerCase() === himaniDefault.email.toLowerCase()))) {
-      state.users.splice(1, 0, { ...himaniDefault, status: himaniDefault.status || 'ACTIVE' });
-      changed = true;
-    }
-
-    return changed;
+    const raw = fs.readFileSync(DEFAULT_USERS_FILE, 'utf8');
+    return crypto.createHash('sha256').update(raw).digest('hex');
   } catch {
-    return false;
+    return null;
+  }
+}
+
+function syncDefaultUsersIntoState(state: ServerCRMState): { changed: boolean; migratedRefs: boolean } {
+  if (!fs.existsSync(DEFAULT_USERS_FILE)) return { changed: false, migratedRefs: false };
+  try {
+    const rawText = fs.readFileSync(DEFAULT_USERS_FILE, 'utf8');
+    const currentDigest = crypto.createHash('sha256').update(rawText).digest('hex');
+    if (state.defaultUsersDigest === currentDigest) {
+      return { changed: false, migratedRefs: false };
+    }
+
+    const defaultUsers: any[] = JSON.parse(rawText);
+    const idMigrations = new Map<string, string>();
+    const normalizePhone10 = (p: any) => {
+      const digits = String(p || '').replace(/\D/g, '');
+      return digits.length >= 10 ? digits.slice(-10) : '';
+    };
+
+    for (const du of defaultUsers) {
+      const duEmail = String(du.email || '').trim().toLowerCase();
+      const duName = String(du.name || '').trim().toLowerCase();
+      const duPhone10 = normalizePhone10(du.mobile_number || du.mobile);
+
+      let existing = state.users.find((u) => u.id === du.id);
+      if (!existing && duEmail) {
+        existing = state.users.find((u) => u.email && String(u.email).trim().toLowerCase() === duEmail);
+      }
+      if (!existing && duName) {
+        existing = state.users.find((u) => u.name && String(u.name).trim().toLowerCase() === duName);
+      }
+      if (!existing && duPhone10) {
+        existing = state.users.find((u) => {
+          const p10 = normalizePhone10(u.mobile_number || u.mobile);
+          return Boolean(p10 && p10 === duPhone10);
+        });
+      }
+
+      if (existing) {
+        if (existing.id !== du.id) {
+          idMigrations.set(existing.id, du.id);
+        }
+        existing.id = du.id;
+        existing.name = du.name;
+        if (duEmail) existing.email = duEmail;
+        existing.username = String(du.username || duEmail || existing.username || '').trim().toLowerCase();
+        existing.role = du.role;
+        existing.department = du.department;
+        existing.daily_call_goal = du.daily_call_goal ?? (du.role === 'SUPER_ADMIN' ? 0 : 60);
+        if (du.mobile_number !== undefined) existing.mobile_number = du.mobile_number;
+        if (!existing.status) existing.status = du.status || 'ACTIVE';
+      } else {
+        state.users.push({
+          ...du,
+          email: duEmail,
+          username: String(du.username || duEmail).trim().toLowerCase(),
+          status: du.status || 'ACTIVE',
+          failed_logins: 0,
+          created_at: du.created_at || new Date().toISOString(),
+        });
+      }
+    }
+
+    if (idMigrations.size > 0) {
+      state.students.forEach((s) => {
+        if (s.mentor_id && idMigrations.has(s.mentor_id)) {
+          s.mentor_id = idMigrations.get(s.mentor_id);
+        }
+      });
+      state.campaignAssignments.forEach((a) => {
+        if (a.mentor_id && idMigrations.has(a.mentor_id)) {
+          a.mentor_id = idMigrations.get(a.mentor_id);
+        }
+      });
+      state.callLogs.forEach((c) => {
+        if (c.mentor_id && idMigrations.has(c.mentor_id)) {
+          c.mentor_id = idMigrations.get(c.mentor_id);
+        }
+      });
+      state.externalLeads.forEach((l) => {
+        if (l.assigned_to && idMigrations.has(l.assigned_to)) {
+          l.assigned_to = idMigrations.get(l.assigned_to);
+        }
+      });
+      state.campaigns.forEach((camp) => {
+        if (Array.isArray(camp.target_mentor_ids)) {
+          camp.target_mentor_ids = camp.target_mentor_ids.map((id: string) => idMigrations.get(id) || id);
+        }
+      });
+    }
+
+    state.defaultUsersDigest = currentDigest;
+    return { changed: true, migratedRefs: idMigrations.size > 0 };
+  } catch (err) {
+    console.warn('[Narayana CRM] defaultUsers sync warning:', err);
+    return { changed: false, migratedRefs: false };
   }
 }
 
@@ -377,7 +467,9 @@ function loadServerState(): ServerCRMState {
     try {
       const parsed = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
       if (parsed && Array.isArray(parsed.users) && Array.isArray(parsed.students)) {
-        if (syncDefaultUsersIntoState(parsed)) {
+        const syncRes = syncDefaultUsersIntoState(parsed);
+        if (syncRes.changed) {
+          parsed.version = (parsed.version || 1) + 1;
           saveServerStateLocal(parsed);
         }
         return parsed;
@@ -411,7 +503,7 @@ async function upsertSectionsWithRetry(pool: Pool, names: string[], payloads: st
   `;
   try {
     await pool.query(query, [names, payloads]);
-  } catch (firstErr) {
+  } catch {
     // Handle Neon scale-to-zero wakeup transient failure with a single retry
     await new Promise((r) => setTimeout(r, 600));
     await pool.query(query, [names, payloads]);
@@ -432,6 +524,14 @@ function persistStateToPostgres(state: ServerCRMState, sections: StateSection[] 
     .catch((err) => {
       console.error('[Narayana CRM] PostgreSQL save error:', err);
     });
+}
+
+async function flushPostgresPersistence(timeoutMs: number = 5000): Promise<void> {
+  if (!pgPool) return;
+  await Promise.race([
+    pgPersistChain,
+    new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
+  ]);
 }
 
 function saveServerState(state: ServerCRMState, sections: StateSection[] = ALL_SECTIONS) {
@@ -461,6 +561,7 @@ async function initCloudPersistence(): Promise<void> {
     const secRes = await pgPool.query(`SELECT section, payload FROM crm_state_sections`);
     if (secRes.rows.length > 0) {
       const merged = createSeedState();
+      merged.defaultUsersDigest = undefined;
       const loadedSections = new Set<string>();
       secRes.rows.forEach((row) => {
         if (ALL_SECTIONS.includes(row.section)) {
@@ -469,13 +570,19 @@ async function initCloudPersistence(): Promise<void> {
         }
       });
 
-      const usersMerged = syncDefaultUsersIntoState(merged);
+      const usersSync = syncDefaultUsersIntoState(merged);
+      if (usersSync.changed) {
+        merged.version = (merged.version || 1) + 1;
+      }
       serverState = merged;
       saveServerStateLocal(serverState);
 
       const missing = ALL_SECTIONS.filter((s) => !loadedSections.has(s));
-      if (missing.length > 0 || usersMerged) {
-        const toSave: StateSection[] = usersMerged ? Array.from(new Set([...missing, 'users'])) : missing;
+      if (missing.length > 0 || usersSync.changed) {
+        const extraSections: StateSection[] = usersSync.changed
+          ? ['users', 'meta', ...(usersSync.migratedRefs ? (['students', 'campaignAssignments', 'callLogs', 'externalLeads', 'campaigns'] as StateSection[]) : [])]
+          : [];
+        const toSave: StateSection[] = Array.from(new Set([...missing, ...extraSections]));
         await upsertSectionsWithRetry(
           pgPool,
           toSave,
@@ -484,7 +591,7 @@ async function initCloudPersistence(): Promise<void> {
       }
 
       console.log(
-        `[Narayana CRM] Loaded state from Neon PostgreSQL (${secRes.rows.length} sections, version ${serverState.version}, ${serverState.users.length} users, ${serverState.students.length} students)`
+        `[Narayana CRM] Loaded state from Neon PostgreSQL (${secRes.rows.length} sections, version ${serverState.version}, ${serverState.users.length} users, ${serverState.students.length} students${usersSync.changed ? ', reconciled defaultUsers.json' : ''})`
       );
       return;
     }
@@ -689,6 +796,7 @@ async function startServer() {
   app.get('/api/health', (_req, res) => {
     res.json({
       ok: true,
+      appVersion: APP_VERSION,
       version: serverState.version,
       persistenceMode: pgPool ? 'POSTGRESQL_CLOUD' : 'LOCAL_JSON',
       time: new Date().toISOString(),
@@ -707,7 +815,7 @@ async function startServer() {
     });
   });
 
-  app.post('/api/admin/restore-state', requireAuth, (req: AuthedRequest, res) => {
+  app.post('/api/admin/restore-state', requireAuth, async (req: AuthedRequest, res) => {
     if (req.authUser.role !== 'SUPER_ADMIN') {
       res.status(403).json({ error: 'Forbidden: Super Admin access required.' });
       return;
@@ -730,6 +838,7 @@ async function startServer() {
       meta: { usersCount: serverState.users.length, studentsCount: serverState.students.length },
     });
     broadcastStateChanged('STATE_RESTORED', req.authUser.id);
+    await flushPostgresPersistence();
     res.json({ ok: true, version: serverState.version, usersCount: serverState.users.length });
   });
 
@@ -871,7 +980,7 @@ async function startServer() {
     });
   });
 
-  app.post('/api/actions', requireAuth, (req: AuthedRequest, res) => {
+  app.post('/api/actions', requireAuth, async (req: AuthedRequest, res) => {
     const user = req.authUser;
     const { action, payload = {} } = req.body || {};
     const todayIST = getISTCalendarDate();
@@ -1108,6 +1217,7 @@ async function startServer() {
 
         case 'USER_ADD': {
           const emailLower = String(payload.email || '').trim().toLowerCase();
+          const usernameLower = String(payload.username || emailLower).trim().toLowerCase();
           if (!emailLower || !String(payload.name || '').trim()) {
             res.status(400).json({ error: 'Name and valid institutional email are required.' });
             return;
@@ -1116,11 +1226,15 @@ async function startServer() {
             res.status(409).json({ error: `A staff account with email "${emailLower}" already exists.` });
             return;
           }
+          if (usernameLower && serverState.users.some((u) => u.username && u.username.toLowerCase() === usernameLower)) {
+            res.status(409).json({ error: `A staff account with username "${usernameLower}" already exists.` });
+            return;
+          }
           const newUser = {
             id: payload.id || `user-${Date.now()}`,
             ...payload,
             email: emailLower,
-            username: String(payload.username || emailLower).trim().toLowerCase(),
+            username: usernameLower,
             status: payload.status || 'ACTIVE',
             failed_logins: 0,
             created_at: payload.created_at || nowIso,
@@ -1132,10 +1246,11 @@ async function startServer() {
             action: 'ASSIGNMENT',
             entity: 'User',
             entity_id: newUser.id,
-            meta: { name: newUser.name, role: newUser.role },
+            meta: { name: newUser.name, role: newUser.role, username: newUser.username },
           });
           broadcastStateChanged(action, user.id);
-          res.json({ ok: true, version: serverState.version, user: sanitizeUserForClient(newUser) });
+          await flushPostgresPersistence();
+          res.json({ ok: true, version: serverState.version, user: sanitizeUserForClient(newUser), persistedToCloud: Boolean(pgPool) });
           return;
         }
 
@@ -1154,29 +1269,44 @@ async function startServer() {
             }
             partial.email = nextEmail;
           }
+          if (partial.username !== undefined) {
+            const nextUsername = String(partial.username || partial.email || serverState.users[idx].email || '').trim().toLowerCase();
+            if (nextUsername && serverState.users.some((u) => u.id !== payload.id && u.username && u.username.toLowerCase() === nextUsername)) {
+              res.status(409).json({ error: `Another account already uses username "${nextUsername}".` });
+              return;
+            }
+            partial.username = nextUsername;
+          }
           if (partial.password_hash) {
             partial.failed_logins = 0;
             partial.locked_until = undefined;
             partial.password = undefined;
           }
           serverState.users[idx] = { ...serverState.users[idx], ...partial };
-          if (serverState.users[idx].status === 'INACTIVE') {
-            wsClients.forEach((client) => {
-              if (client.userId === payload.id) {
+          wsClients.forEach((client) => {
+            if (client.userId === payload.id) {
+              client.role = serverState.users[idx].role;
+              if (serverState.users[idx].status === 'INACTIVE') {
                 try { client.ws.close(4001, 'Account deactivated'); } catch {}
               }
-            });
-          }
+            }
+          });
           appendAudit({
             user_name: user.name,
             user_role: user.role,
             action: 'SETTINGS_CHANGE',
             entity: 'User',
             entity_id: payload.id,
-            meta: { name: serverState.users[idx].name, status: serverState.users[idx].status, passwordChanged: Boolean(partial.password_hash) },
+            meta: {
+              name: serverState.users[idx].name,
+              role: serverState.users[idx].role,
+              status: serverState.users[idx].status,
+              passwordChanged: Boolean(partial.password_hash),
+            },
           });
           broadcastStateChanged(action, user.id, [payload.id]);
-          res.json({ ok: true, version: serverState.version, user: sanitizeUserForClient(serverState.users[idx]) });
+          await flushPostgresPersistence();
+          res.json({ ok: true, version: serverState.version, user: sanitizeUserForClient(serverState.users[idx]), persistedToCloud: Boolean(pgPool) });
           return;
         }
 
@@ -1211,7 +1341,8 @@ async function startServer() {
             meta: { deletedName: removed.name, deletedEmail: removed.email },
           });
           broadcastStateChanged(action, user.id);
-          res.json({ ok: true, version: serverState.version });
+          await flushPostgresPersistence();
+          res.json({ ok: true, version: serverState.version, persistedToCloud: Boolean(pgPool) });
           return;
         }
 
@@ -1444,18 +1575,17 @@ async function startServer() {
   // ---------------------------------------------------------------------------
   const distDir = path.join(process.cwd(), 'dist');
   const distIndex = path.join(distDir, 'index.html');
+  const isTsxRuntime = process.argv.some((arg) => arg.includes('tsx')) || process.execArgv.some((arg) => arg.includes('tsx'));
+  const isProd = process.env.NODE_ENV === 'production' || process.env.RENDER === 'true' || !isTsxRuntime;
 
-  if (!fs.existsSync(distIndex)) {
-    console.log('[Narayana CRM Server] dist/index.html not found. Building application...');
+  if (isProd && !fs.existsSync(distIndex)) {
+    console.log('[Narayana CRM Server] dist/index.html not found in production. Building application...');
     try {
       execSync('npm run build', { stdio: 'inherit' });
     } catch (e) {
       console.warn('Auto-build failed:', e);
     }
   }
-
-  const isTsxRuntime = process.argv.some((arg) => arg.includes('tsx')) || process.execArgv.some((arg) => arg.includes('tsx'));
-  const isProd = process.env.NODE_ENV === 'production' || !isTsxRuntime || fs.existsSync(distIndex);
 
   if (!isProd) {
     const { createServer: createViteServer } = await import('vite');
