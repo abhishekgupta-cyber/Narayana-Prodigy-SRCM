@@ -3,10 +3,15 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { execSync } from 'child_process';
+import dotenv from 'dotenv';
 import express from 'express';
 import type { Request, Response, NextFunction } from 'express';
 import { WebSocketServer, WebSocket } from 'ws';
 import { Pool } from 'pg';
+
+// Load local Neon / environment files without overriding platform-injected env vars (Render / Cloud Run)
+dotenv.config({ path: path.join(process.cwd(), '.env.local') });
+dotenv.config({ path: path.join(process.cwd(), '.env') });
 
 const PORT = process.env.RENDER ? Number(process.env.PORT || 3000) : 3000;
 const DATA_DIR = path.join(process.cwd(), 'data');
@@ -256,6 +261,58 @@ function createSeedState(): ServerCRMState {
   };
 }
 
+type StateSection =
+  | 'meta'
+  | 'users'
+  | 'students'
+  | 'callLogs'
+  | 'campaigns'
+  | 'campaignAssignments'
+  | 'externalLeads'
+  | 'exams'
+  | 'attendance'
+  | 'uploadBatches'
+  | 'auditLogs';
+
+const ALL_SECTIONS: StateSection[] = [
+  'meta',
+  'users',
+  'students',
+  'callLogs',
+  'campaigns',
+  'campaignAssignments',
+  'externalLeads',
+  'exams',
+  'attendance',
+  'uploadBatches',
+  'auditLogs',
+];
+
+function extractSectionPayload(state: ServerCRMState, section: StateSection): any {
+  if (section === 'meta') {
+    return {
+      version: state.version,
+      sessions: state.sessions,
+      activeSessionId: state.activeSessionId,
+      settings: state.settings,
+    };
+  }
+  return state[section];
+}
+
+function applySectionPayload(target: ServerCRMState, section: StateSection, payload: any) {
+  if (section === 'meta' && payload && typeof payload === 'object') {
+    if (typeof payload.version === 'number') target.version = payload.version;
+    if (Array.isArray(payload.sessions)) target.sessions = payload.sessions;
+    if (payload.activeSessionId) target.activeSessionId = payload.activeSessionId;
+    if (payload.settings) target.settings = { ...target.settings, ...payload.settings };
+    return;
+  }
+  if (Array.isArray(payload)) {
+    (target as any)[section] = payload;
+  }
+}
+
 let pgPool: Pool | null = null;
 let pgPersistChain: Promise<void> = Promise.resolve();
 
@@ -263,13 +320,26 @@ function createPgPoolIfConfigured(): Pool | null {
   if (!DATABASE_URL) return null;
   try {
     const isLocalhost = DATABASE_URL.includes('localhost') || DATABASE_URL.includes('127.0.0.1');
-    return new Pool({
-      connectionString: DATABASE_URL,
-      ssl: isLocalhost ? undefined : { rejectUnauthorized: false },
+    const isNeonHost = DATABASE_URL.includes('.neon.tech');
+    // Normalize sslmode=require to verify-full for Neon so pg v8 verifies certs cleanly without warnings
+    const normalizedUrl = isNeonHost
+      ? DATABASE_URL.replace(/sslmode=require\b/gi, 'sslmode=verify-full')
+      : DATABASE_URL;
+
+    const pool = new Pool({
+      connectionString: normalizedUrl,
+      ssl: isLocalhost ? undefined : isNeonHost ? undefined : { rejectUnauthorized: false },
       max: 5,
-      idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 10000,
+      idleTimeoutMillis: 20000,
+      connectionTimeoutMillis: 15000,
     });
+
+    // Prevent unhandled idle-client disconnect crashes when Neon suspends compute (scale-to-zero)
+    pool.on('error', (err) => {
+      console.warn('[Narayana CRM] PostgreSQL pool idle client notice:', err.message);
+    });
+
+    return pool;
   } catch (err) {
     console.warn('[Narayana CRM] Failed to initialize PostgreSQL pool, using local JSON fallback:', err);
     return null;
@@ -332,26 +402,41 @@ function saveServerStateLocal(state: ServerCRMState) {
   }
 }
 
-function persistStateToPostgres(state: ServerCRMState) {
+async function upsertSectionsWithRetry(pool: Pool, names: string[], payloads: string[]): Promise<void> {
+  const query = `
+    INSERT INTO crm_state_sections (section, payload, updated_at)
+    SELECT s, p, NOW()
+    FROM unnest($1::text[], $2::jsonb[]) AS t(s, p)
+    ON CONFLICT (section) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()
+  `;
+  try {
+    await pool.query(query, [names, payloads]);
+  } catch (firstErr) {
+    // Handle Neon scale-to-zero wakeup transient failure with a single retry
+    await new Promise((r) => setTimeout(r, 600));
+    await pool.query(query, [names, payloads]);
+  }
+}
+
+function persistStateToPostgres(state: ServerCRMState, sections: StateSection[] = ALL_SECTIONS) {
   if (!pgPool) return;
-  const snapshotJson = JSON.stringify(state);
+  const uniqueSections = Array.from(new Set(sections));
+  const names = uniqueSections;
+  const payloads = uniqueSections.map((sec) => JSON.stringify(extractSectionPayload(state, sec)));
+
   pgPersistChain = pgPersistChain
     .then(async () => {
-      await pgPool!.query(
-        `INSERT INTO crm_app_state (id, state, updated_at)
-         VALUES ('primary', $1::jsonb, NOW())
-         ON CONFLICT (id) DO UPDATE SET state = EXCLUDED.state, updated_at = NOW()`,
-        [snapshotJson]
-      );
+      if (!pgPool) return;
+      await upsertSectionsWithRetry(pgPool, names, payloads);
     })
     .catch((err) => {
       console.error('[Narayana CRM] PostgreSQL save error:', err);
     });
 }
 
-function saveServerState(state: ServerCRMState) {
+function saveServerState(state: ServerCRMState, sections: StateSection[] = ALL_SECTIONS) {
   saveServerStateLocal(state);
-  persistStateToPostgres(state);
+  persistStateToPostgres(state, sections);
 }
 
 let serverState: ServerCRMState = loadServerState();
@@ -360,38 +445,70 @@ const activeDialSessions = new Map<string, { startedAt: string; contactUsed: 'PR
 async function initCloudPersistence(): Promise<void> {
   pgPool = createPgPoolIfConfigured();
   if (!pgPool) {
-    console.log('[Narayana CRM] Persistence mode: LOCAL_JSON (set DATABASE_URL for unlimited-refresh PostgreSQL cloud sync)');
+    console.log('[Narayana CRM] Persistence mode: LOCAL_JSON (set DATABASE_URL for unlimited-refresh Neon PostgreSQL cloud sync)');
     return;
   }
 
   try {
     await pgPool.query(`
-      CREATE TABLE IF NOT EXISTS crm_app_state (
-        id TEXT PRIMARY KEY,
-        state JSONB NOT NULL,
+      CREATE TABLE IF NOT EXISTS crm_state_sections (
+        section TEXT PRIMARY KEY,
+        payload JSONB NOT NULL,
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
     `);
 
-    const res = await pgPool.query(`SELECT state FROM crm_app_state WHERE id = 'primary' LIMIT 1`);
-    if (res.rows.length > 0 && res.rows[0]?.state) {
-      const dbState = res.rows[0].state as ServerCRMState;
+    const secRes = await pgPool.query(`SELECT section, payload FROM crm_state_sections`);
+    if (secRes.rows.length > 0) {
+      const merged = createSeedState();
+      const loadedSections = new Set<string>();
+      secRes.rows.forEach((row) => {
+        if (ALL_SECTIONS.includes(row.section)) {
+          applySectionPayload(merged, row.section as StateSection, row.payload);
+          loadedSections.add(row.section);
+        }
+      });
+
+      const usersMerged = syncDefaultUsersIntoState(merged);
+      serverState = merged;
+      saveServerStateLocal(serverState);
+
+      const missing = ALL_SECTIONS.filter((s) => !loadedSections.has(s));
+      if (missing.length > 0 || usersMerged) {
+        const toSave: StateSection[] = usersMerged ? Array.from(new Set([...missing, 'users'])) : missing;
+        await upsertSectionsWithRetry(
+          pgPool,
+          toSave,
+          toSave.map((sec) => JSON.stringify(extractSectionPayload(serverState, sec)))
+        );
+      }
+
+      console.log(
+        `[Narayana CRM] Loaded state from Neon PostgreSQL (${secRes.rows.length} sections, version ${serverState.version}, ${serverState.users.length} users, ${serverState.students.length} students)`
+      );
+      return;
+    }
+
+    // Migrate legacy single-row snapshot if present
+    const legacyCheck = await pgPool.query(`SELECT to_regclass('public.crm_app_state') AS tbl`);
+    if (legacyCheck.rows[0]?.tbl) {
+      const legacyRes = await pgPool.query(`SELECT state FROM crm_app_state WHERE id = 'primary' LIMIT 1`);
+      const dbState = legacyRes.rows[0]?.state as ServerCRMState | undefined;
       if (dbState && Array.isArray(dbState.users) && Array.isArray(dbState.students)) {
         syncDefaultUsersIntoState(dbState);
         serverState = dbState;
         saveServerStateLocal(serverState);
-        console.log(`[Narayana CRM] Loaded state from PostgreSQL (version ${serverState.version}, ${serverState.users.length} users)`);
-        return;
       }
     }
 
-    await pgPool.query(
-      `INSERT INTO crm_app_state (id, state, updated_at)
-       VALUES ('primary', $1::jsonb, NOW())
-       ON CONFLICT (id) DO UPDATE SET state = EXCLUDED.state, updated_at = NOW()`,
-      [JSON.stringify(serverState)]
+    await upsertSectionsWithRetry(
+      pgPool,
+      ALL_SECTIONS,
+      ALL_SECTIONS.map((sec) => JSON.stringify(extractSectionPayload(serverState, sec)))
     );
-    console.log('[Narayana CRM] Seeded PostgreSQL cloud database from initial state.');
+    console.log(
+      `[Narayana CRM] Seeded Neon PostgreSQL database (${serverState.users.length} users, ${serverState.students.length} students).`
+    );
   } catch (err) {
     console.error('[Narayana CRM] PostgreSQL initialization failed, falling back to local JSON:', err);
     pgPool = null;
@@ -495,9 +612,32 @@ interface AuthedRequest extends Request {
 
 const wsClients = new Set<{ ws: WebSocket; userId: string; role: string }>();
 
+const ACTION_DIRTY_SECTIONS: Record<string, StateSection[]> = {
+  USER_ADD: ['meta', 'users', 'auditLogs'],
+  USER_UPDATE: ['meta', 'users', 'auditLogs'],
+  USER_DELETE: ['meta', 'users', 'auditLogs'],
+  CALL_SUBMIT: ['meta', 'callLogs', 'students', 'campaignAssignments', 'auditLogs'],
+  CALL_INBOUND_OVERRIDE: ['meta', 'callLogs', 'students', 'campaignAssignments', 'auditLogs'],
+  CAMPAIGN_CREATE: ['meta', 'campaigns', 'auditLogs'],
+  CAMPAIGN_UPDATE: ['meta', 'campaigns', 'auditLogs'],
+  CAMPAIGN_DELETE: ['meta', 'campaigns', 'auditLogs'],
+  BULK_ASSIGN: ['meta', 'campaignAssignments', 'auditLogs'],
+  LEADS_ASSIGN: ['meta', 'externalLeads', 'auditLogs'],
+  LEADS_ADD_BATCH: ['meta', 'externalLeads', 'auditLogs'],
+  ADMISSIONS_REGISTER: ['meta', 'students', 'auditLogs'],
+  EXAMS_ADD: ['meta', 'exams', 'auditLogs'],
+  ATTENDANCE_ADD: ['meta', 'attendance', 'auditLogs'],
+  BATCH_RECORD: ['meta', 'uploadBatches', 'auditLogs'],
+  BATCH_ROLLBACK: ['meta', 'uploadBatches', 'students', 'auditLogs'],
+  SETTINGS_UPDATE: ['meta', 'auditLogs'],
+  SESSION_SET: ['meta', 'auditLogs'],
+  SESSION_ADD: ['meta', 'auditLogs'],
+  STATE_RESTORED: ALL_SECTIONS,
+};
+
 function broadcastStateChanged(action: string, actorId: string, affectedMentorIds?: string[]) {
   serverState.version += 1;
-  saveServerState(serverState);
+  saveServerState(serverState, ACTION_DIRTY_SECTIONS[action] || ALL_SECTIONS);
 
   const payload = JSON.stringify({
     type: 'CRM_STATE_CHANGED',
@@ -645,7 +785,7 @@ async function startServer() {
       if (failed >= 5) {
         user.locked_until = new Date(Date.now() + 15 * 60 * 1000).toISOString();
       }
-      saveServerState(serverState);
+      saveServerState(serverState, ['users']);
       res.status(401).json({ error: genericError });
       return;
     }
@@ -660,7 +800,7 @@ async function startServer() {
       entity_id: user.id,
       meta: { timestamp: new Date().toISOString() },
     });
-    saveServerState(serverState);
+    saveServerState(serverState, ['users', 'auditLogs']);
 
     const token = signToken({
       userId: user.id,
@@ -720,7 +860,7 @@ async function startServer() {
     const targetPhone = contactUsed === 'PRIMARY' ? student.student_mobile : (student.whatsapp_number || student.student_mobile);
     const cleanPhone = String(targetPhone || '').replace(/\D/g, '');
     const dialLink = `tel:${serverState.settings.dial_prefix}${cleanPhone}`;
-    saveServerState(serverState);
+    saveServerState(serverState, ['auditLogs']);
 
     res.json({
       unmaskedPrimary: student.student_mobile,
