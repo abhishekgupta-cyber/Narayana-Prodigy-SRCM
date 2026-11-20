@@ -62,11 +62,12 @@
   {
     "id": "mentor-basarat-ansari-sir",
     "name": "Basarat Ansari Sir",
-    "email": "basarat.ansari.sir@narayanagroup.com",
+    "email": "basarat.ansari@narayanagroup.com",
     "role": "MENTOR",
     "department": "Prodigy Markiting & Operation",
     "daily_call_goal": 60,
-    "mobile_number": "+91 9761479881"
+    "mobile_number": "+91 7857019993",
+    "password_hash": "$v1$z3c15qkv5197$5eafcc85b3129cb9"
   },
   {
     "id": "mentor-surjit-sinha-sir",
