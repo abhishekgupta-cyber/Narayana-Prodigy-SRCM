@@ -189,11 +189,12 @@
   {
     "id": "mentor-mvs-prakash-sir",
     "name": "MVS Prakash Sir",
-    "email": "mvs.prakash.sir@narayanagroup.com",
+    "email": "prakash.mvs@narayanagroup.com",
     "role": "MENTOR",
     "department": "Prodigy Markiting & Operation",
     "daily_call_goal": 60,
-    "mobile_number": "+91 9322657359"
+    "mobile_number": "+91 9652477556",
+    "password_hash": "$v1$v7en6ulqou2f$ebefd68524183eb9"
   },
   {
     "id": "mentor-sonia-dhanwani-maam",
