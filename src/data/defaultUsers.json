@@ -42,11 +42,12 @@
   {
     "id": "mentor-arun-chaubey-sir",
     "name": "Arun Chaubey Sir",
-    "email": "arun.chaubey.sir@narayanagroup.com",
+    "email": "arunkumar.c@narayanagroup.com",
     "role": "MENTOR",
     "department": "Prodigy Markiting & Operation",
     "daily_call_goal": 60,
-    "mobile_number": "+91 9090900483"
+    "mobile_number": "+91 8340653902",
+    "password_hash": "$v1$55tvbuxvyp4g$f4633ac53cb479b9"
   },
   {
     "id": "mentor-akansha-yadav-maam",
