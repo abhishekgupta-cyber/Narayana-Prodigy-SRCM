@@ -123,7 +123,13 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess }) => {
                   type="text"
                   required
                   value={identifier}
-                  onChange={(e) => setIdentifier(e.target.value)}
+                  onChange={(e) => {
+                    setIdentifier(e.target.value);
+                    if (failCount > 0 || isLocked) {
+                      setFailCount(0);
+                      setIsLocked(false);
+                    }
+                  }}
                   placeholder="name@narayanagroup.com or 10-digit mobile"
                   autoComplete="username"
                   className="w-full text-xs font-medium text-slate-900 border border-slate-300 rounded-lg px-3.5 py-2.5 focus:outline-none focus:ring-2 focus:ring-amber-500 focus:border-amber-500 transition-all placeholder:text-slate-400"

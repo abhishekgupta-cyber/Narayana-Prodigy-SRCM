@@ -1048,6 +1048,7 @@ const ACTION_DIRTY_SECTIONS: Record<string, StateSection[]> = {
   SETTINGS_UPDATE: ['meta', 'auditLogs'],
   SESSION_SET: ['meta', 'auditLogs'],
   SESSION_ADD: ['meta', 'auditLogs'],
+  SECURITY_ALERT: ['meta', 'auditLogs'],
   STATE_RESTORED: ALL_SECTIONS,
 };
 
@@ -1186,25 +1187,66 @@ async function startServer() {
     res.json({ ok: true, version: serverState.version, usersCount: serverState.users.length });
   });
 
-  app.post('/api/auth/login', (req, res) => {
+  app.post('/api/auth/login', async (req, res) => {
     const { identifier, password } = req.body || {};
     if (typeof identifier !== 'string' || typeof password !== 'string') {
       res.status(400).json({ error: 'Credentials are required.' });
       return;
     }
 
-    const term = identifier.trim().toLowerCase();
-    const digitsOnly = identifier.replace(/\D/g, '');
-    const last10 = digitsOnly.length >= 10 ? digitsOnly.slice(-10) : '';
+    const findMatchingUser = () => {
+      const term = identifier.trim().toLowerCase();
+      const digitsOnly = identifier.replace(/\D/g, '');
+      const last10 = digitsOnly.length >= 10 ? digitsOnly.slice(-10) : '';
 
-    const user = serverState.users.find((u) => {
-      if (u.email && u.email.toLowerCase() === term) return true;
-      if (u.username && u.username.toLowerCase() === term) return true;
-      if (u.name && u.name.toLowerCase() === term) return true;
-      if (last10 && u.mobile_number && String(u.mobile_number).replace(/\D/g, '').endsWith(last10)) return true;
-      if (last10 && u.mobile && String(u.mobile).replace(/\D/g, '').endsWith(last10)) return true;
-      return false;
-    });
+      let matched = serverState.users.find((u) => {
+        if (u.email && String(u.email).trim().toLowerCase() === term) return true;
+        if (u.username && String(u.username).trim().toLowerCase() === term) return true;
+        if (u.name && String(u.name).trim().toLowerCase() === term) return true;
+        if (last10 && u.mobile_number && String(u.mobile_number).replace(/\D/g, '').endsWith(last10)) return true;
+        if (last10 && u.mobile && String(u.mobile).replace(/\D/g, '').endsWith(last10)) return true;
+        return false;
+      });
+
+      if (!matched && term && !term.includes('@')) {
+        const prefixMatches = serverState.users.filter((u) => {
+          const emailPrefix = String(u.email || '').trim().toLowerCase().split('@')[0];
+          return Boolean(emailPrefix && emailPrefix === term);
+        });
+        if (prefixMatches.length === 1) {
+          matched = prefixMatches[0];
+        }
+      }
+      return matched;
+    };
+
+    const checkUserPassword = (candidateUser: any): boolean => {
+      const envSeedPassword = process.env.SEED_ADMIN_PASSWORD || process.env.VITE_SEED_ADMIN_PASSWORD || '';
+      const trimmedPassword = password.trim();
+      if (candidateUser.password_hash) {
+        return (
+          verifyStoredPassword(password, candidateUser.password_hash) ||
+          (trimmedPassword !== password && verifyStoredPassword(trimmedPassword, candidateUser.password_hash))
+        );
+      }
+      if (candidateUser.password) {
+        return candidateUser.password === password || (trimmedPassword !== password && candidateUser.password === trimmedPassword);
+      }
+      if (candidateUser.id === 'admin-1' && envSeedPassword) {
+        return password === envSeedPassword;
+      }
+      return Boolean(trimmedPassword);
+    };
+
+    let user = findMatchingUser();
+    let passwordValid = user ? checkUserPassword(user) : false;
+
+    // If user or password doesn't match cached RAM, pull latest Neon PostgreSQL users immediately
+    if (pgPool && (!user || user.status === 'INACTIVE' || !passwordValid || user.locked_until)) {
+      await syncExternalChangesFromPostgres();
+      user = findMatchingUser();
+      passwordValid = user ? checkUserPassword(user) : false;
+    }
 
     const genericError = 'Invalid credentials. Please contact your Super Admin.';
     if (!user || user.status === 'INACTIVE') {
@@ -1218,18 +1260,6 @@ async function startServer() {
         error: `Account locked due to 5 failed attempts. Please retry in ${waitMin} minutes.`,
       });
       return;
-    }
-
-    const envSeedPassword = process.env.SEED_ADMIN_PASSWORD || process.env.VITE_SEED_ADMIN_PASSWORD || '';
-    let passwordValid = true;
-    if (user.password_hash) {
-      passwordValid = verifyStoredPassword(password, user.password_hash);
-    } else if (user.password) {
-      passwordValid = user.password === password;
-    } else if (user.id === 'admin-1' && envSeedPassword) {
-      passwordValid = password === envSeedPassword;
-    } else if (!password.trim()) {
-      passwordValid = false;
     }
 
     if (!passwordValid) {
@@ -1631,10 +1661,11 @@ async function startServer() {
             partial.username = nextUsername;
           }
           if (partial.password_hash) {
-            partial.failed_logins = 0;
-            partial.locked_until = undefined;
             partial.password = undefined;
           }
+          // Any Admin profile edit also clears previous login lockouts cleanly
+          partial.failed_logins = 0;
+          partial.locked_until = undefined;
           serverState.users[idx] = { ...serverState.users[idx], ...partial };
           const codeSynced = syncStateUsersToDefaultUsersFile(serverState);
           void syncDefaultUsersToGitHubIfConfigured(serverState);
@@ -1700,6 +1731,23 @@ async function startServer() {
           broadcastStateChanged(action, user.id);
           await flushPostgresPersistence();
           res.json({ ok: true, version: serverState.version, persistedToCloud: Boolean(pgPool), syncedToCode: codeSynced });
+          return;
+        }
+
+        case 'SECURITY_ALERT': {
+          const detail = String(payload.detail || `Screenshot Attempt by ${user.name}`).slice(0, 200);
+          const shortcut = String(payload.shortcut || 'CAPTURE_SHORTCUT').slice(0, 80);
+          appendAudit({
+            user_name: user.name,
+            user_role: user.role,
+            action: 'SECURITY_ALERT',
+            entity: 'PrivacyShield',
+            entity_id: detail,
+            meta: { shortcut, detail, userId: user.id, timestamp: nowIso },
+          });
+          broadcastStateChanged(action, user.id, []);
+          await flushPostgresPersistence();
+          res.json({ ok: true, version: serverState.version });
           return;
         }
 

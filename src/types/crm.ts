@@ -342,7 +342,7 @@ export interface AuditLog {
   id: string;
   user_name: string;
   user_role: string;
-  action: 'LOGIN' | 'UNMASK_PHONE' | 'CALL_SUBMIT' | 'INBOUND_UPDATE' | 'ASSIGNMENT' | 'EXPORT_EXCEL' | 'UPLOAD' | 'ROLLBACK' | 'SETTINGS_CHANGE';
+  action: 'LOGIN' | 'UNMASK_PHONE' | 'CALL_SUBMIT' | 'INBOUND_UPDATE' | 'ASSIGNMENT' | 'EXPORT_EXCEL' | 'UPLOAD' | 'ROLLBACK' | 'SETTINGS_CHANGE' | 'SECURITY_ALERT';
   entity: string;
   entity_id: string;
   meta?: any;

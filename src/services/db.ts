@@ -2475,7 +2475,7 @@ class CRMDatabase {
     const digitsOnly = usernameOrEmail.replace(/\D/g, '');
     const last10 = digitsOnly.length >= 10 ? digitsOnly.slice(-10) : '';
 
-    const user = this.users.find((u) => {
+    let user = this.users.find((u) => {
       if (u.email.toLowerCase() === term) return true;
       if (u.username && u.username.toLowerCase() === term) return true;
       if (u.name.toLowerCase() === term) return true;
@@ -2483,6 +2483,16 @@ class CRMDatabase {
       if (last10 && u.mobile && u.mobile.replace(/\D/g, '').endsWith(last10)) return true;
       return false;
     });
+
+    if (!user && term && !term.includes('@')) {
+      const prefixMatches = this.users.filter((u) => {
+        const prefix = String(u.email || '').trim().toLowerCase().split('@')[0];
+        return Boolean(prefix && prefix === term);
+      });
+      if (prefixMatches.length === 1) {
+        user = prefixMatches[0];
+      }
+    }
 
     // Generic error per Section 4.1 (do not reveal if username exists)
     const genericError = 'Invalid credentials. Please contact your Super Admin.';
@@ -2498,14 +2508,17 @@ class CRMDatabase {
     }
 
     const envSeedPassword = (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_SEED_ADMIN_PASSWORD) || '';
+    const trimmedPassword = password.trim();
     let passwordValid = true;
     if (user.password_hash) {
-      passwordValid = this.verifyPassword(password, user.password_hash);
+      passwordValid =
+        this.verifyPassword(password, user.password_hash) ||
+        (trimmedPassword !== password && this.verifyPassword(trimmedPassword, user.password_hash));
     } else if (user.password) {
-      passwordValid = user.password === password;
+      passwordValid = user.password === password || (trimmedPassword !== password && user.password === trimmedPassword);
     } else if (user.id === 'admin-1' && envSeedPassword) {
       passwordValid = password === envSeedPassword;
-    } else if (!password.trim()) {
+    } else if (!trimmedPassword) {
       passwordValid = false;
     }
 
@@ -2534,6 +2547,20 @@ class CRMDatabase {
     });
 
     return { success: true, user };
+  }
+
+  public reportSecurityAlert(user: User, shortcut: string, detail?: string): void {
+    const summary = detail || `Screenshot Attempt by ${user.name} (${shortcut})`;
+    this.logAudit({
+      user_name: user.name,
+      user_role: user.role,
+      action: 'SECURITY_ALERT',
+      entity: 'PrivacyShield',
+      entity_id: summary,
+      meta: { shortcut, detail: summary, userId: user.id, timestamp: new Date().toISOString() },
+    });
+    void this.pushActionToServer('SECURITY_ALERT', { shortcut, detail: summary });
+    this.notifyListeners();
   }
 
   public recordFailedLogin(usernameOrEmail: string): { failedAttempts: number; isLocked: boolean } {

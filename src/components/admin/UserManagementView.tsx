@@ -736,6 +736,7 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
                 <div className="relative">
                   <input
                     type={showPassword ? 'text' : 'password'}
+                    autoComplete="new-password"
                     placeholder={editingUser ? 'Enter new password to reset' : 'Set secure initial password'}
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
@@ -749,6 +750,9 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
                     {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                   </button>
                 </div>
+                <p className="text-[11px] text-slate-500">
+                  Staff can sign in with their <strong>Email</strong>, <strong>Username</strong>, or <strong>10-digit Mobile Number</strong>.
+                </p>
 
                 <div className="flex items-center gap-2 pt-1">
                   <input

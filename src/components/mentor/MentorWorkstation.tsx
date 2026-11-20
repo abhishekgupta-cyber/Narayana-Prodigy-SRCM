@@ -21,6 +21,8 @@ import {
   UserCheck,
   ChevronRight,
   Shield,
+  ShieldAlert,
+  Lock,
   Layers,
   Sparkles,
   Edit3,
@@ -130,11 +132,15 @@ export const MentorWorkstation: React.FC<MentorWorkstationProps> = ({
   const [inboundSubmitting, setInboundSubmitting] = useState(false);
   const [inboundError, setInboundError] = useState('');
 
-  // Live IST Watermark & Blur-on-Unfocus (Section 12)
+  // Live IST Watermark & Full Black Privacy Shield (Section 12)
   const [isWindowBlurred, setIsWindowBlurred] = useState(false);
+  const [isCaptureBlocked, setIsCaptureBlocked] = useState(false);
+  const [shieldMessage, setShieldMessage] = useState('');
   const [watermarkTime, setWatermarkTime] = useState(formatISTDateTime(new Date()));
   const [toastMessage, setToastMessage] = useState('');
   const [toastType, setToastType] = useState<'success' | 'error'>('success');
+  const lastSecurityLogRef = useRef<number>(0);
+  const captureTimeoutRef = useRef<any>(null);
 
   // Load Workstation Data
   const loadData = () => {
@@ -166,39 +172,119 @@ export const MentorWorkstation: React.FC<MentorWorkstationProps> = ({
     return unsubscribe;
   }, [currentUser.id, activeSessionId, myStudentsPage, myStudentsLimit, myStudentsSearch]);
 
-  // Section 12: Non-Admin Security Deterrents (Watermark, Shortcut and Blur events)
+  // Section 12: Non-Admin Security Deterrents (Full Black Privacy Shield, Screenshot Block + Clipboard Clear + Admin Log, Watermark)
   useEffect(() => {
     const wmInterval = setInterval(() => {
       setWatermarkTime(formatISTDateTime(new Date()));
     }, 1000);
 
-    const handleFocus = () => setIsWindowBlurred(false);
-    const handleBlur = () => setIsWindowBlurred(true);
+    const triggerCaptureDefense = (shortcutLabel: string) => {
+      setIsCaptureBlocked(true);
+      setShieldMessage(`Capture Attempt Blocked (${shortcutLabel}) — Logged to Admin Audit`);
+      if (captureTimeoutRef.current) clearTimeout(captureTimeoutRef.current);
+      captureTimeoutRef.current = setTimeout(() => {
+        setIsCaptureBlocked(false);
+        setShieldMessage('');
+      }, 4000);
 
-    const handleKeyDown = (e: KeyboardEvent) => {
-      // Block Ctrl+C, Ctrl+X, Ctrl+A, Ctrl+U, Ctrl+S, Ctrl+P, F12, PrintScreen
-      if (
-        (e.ctrlKey || e.metaKey) &&
-        ['c', 'x', 'a', 'u', 's', 'p'].includes(e.key.toLowerCase())
-      ) {
-        e.preventDefault();
+      // Auto-clear clipboard so PrintScreen / copy yields nothing useful
+      try {
+        if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+          void navigator.clipboard
+            .writeText('NARAYANA PRODIGY CONFIDENTIAL - SCREENSHOT BLOCKED')
+            .catch(() => {});
+        }
+      } catch {}
+
+      setToastType('error');
+      setToastMessage(`Security Alert: ${shortcutLabel} blocked & reported to Super Admin.`);
+      setTimeout(() => setToastMessage(''), 4000);
+
+      const now = Date.now();
+      if (now - lastSecurityLogRef.current > 3000) {
+        lastSecurityLogRef.current = now;
+        crmDb.reportSecurityAlert(
+          currentUser,
+          shortcutLabel,
+          `Screenshot Attempt by ${currentUser.name} (${shortcutLabel})`
+        );
       }
-      if (e.key === 'F12' || e.key === 'PrintScreen') {
+    };
+
+    const handleFocus = () => {
+      if (!document.hidden) {
+        setIsWindowBlurred(false);
+      }
+    };
+    const handleBlur = () => {
+      setIsWindowBlurred(true);
+      setShieldMessage('Window Unfocused / External App Detected');
+    };
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        setIsWindowBlurred(true);
+        setShieldMessage('Tab Switched / Screen Minimized');
+      } else {
+        setIsWindowBlurred(false);
+      }
+    };
+
+    const detectAndBlockKey = (e: KeyboardEvent) => {
+      const keyLower = (e.key || '').toLowerCase();
+      const isPrintScreen =
+        e.key === 'PrintScreen' || e.code === 'PrintScreen' || e.keyCode === 44;
+      const isWinShiftS = e.metaKey && e.shiftKey && keyLower === 's';
+      const isMacScreenshot = e.metaKey && e.shiftKey && ['3', '4', '5'].includes(keyLower);
+      const isCtrlShiftS = e.ctrlKey && e.shiftKey && keyLower === 's';
+      const isDevTools =
+        e.key === 'F12' ||
+        ((e.ctrlKey || e.metaKey) && e.shiftKey && ['i', 'j', 'c'].includes(keyLower));
+      const isPrintShortcut = (e.ctrlKey || e.metaKey) && keyLower === 'p';
+
+      if (isPrintScreen || isWinShiftS || isMacScreenshot || isCtrlShiftS) {
         e.preventDefault();
+        e.stopPropagation();
+        const label = isPrintScreen
+          ? 'PrintScreen'
+          : isWinShiftS
+          ? 'Win+Shift+S'
+          : isMacScreenshot
+          ? `Cmd+Shift+${keyLower}`
+          : 'Ctrl+Shift+S';
+        triggerCaptureDefense(label);
+        return;
+      }
+
+      if (isPrintShortcut || isDevTools) {
+        e.preventDefault();
+        e.stopPropagation();
+        triggerCaptureDefense(isPrintShortcut ? 'Print (Ctrl+P)' : 'DevTools Shortcut');
+        return;
+      }
+
+      // Block Ctrl+C, Ctrl+X, Ctrl+A, Ctrl+U, Ctrl+S
+      if ((e.ctrlKey || e.metaKey) && ['c', 'x', 'a', 'u', 's'].includes(keyLower)) {
+        e.preventDefault();
+        e.stopPropagation();
       }
     };
 
     window.addEventListener('focus', handleFocus);
     window.addEventListener('blur', handleBlur);
-    window.addEventListener('keydown', handleKeyDown);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('keydown', detectAndBlockKey, true);
+    window.addEventListener('keyup', detectAndBlockKey, true);
 
     return () => {
       clearInterval(wmInterval);
+      if (captureTimeoutRef.current) clearTimeout(captureTimeoutRef.current);
       window.removeEventListener('focus', handleFocus);
       window.removeEventListener('blur', handleBlur);
-      window.removeEventListener('keydown', handleKeyDown);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('keydown', detectAndBlockKey, true);
+      window.removeEventListener('keyup', detectAndBlockKey, true);
     };
-  }, []);
+  }, [currentUser.id, currentUser.name]);
 
   // Handle Call Initiation (Section 9.1, 9.2, 9.3)
   const handleInitiateCall = async (
@@ -351,24 +437,82 @@ export const MentorWorkstation: React.FC<MentorWorkstationProps> = ({
       ? buckets.pending
       : buckets.newCalls;
 
+  const privacyShieldActive = isWindowBlurred || isCaptureBlocked;
+
   return (
-    <div
-      className={`non-admin-protected print:hidden min-h-screen bg-slate-50/70 py-6 px-4 sm:px-6 lg:px-8 space-y-6 select-none relative ${
-        isWindowBlurred ? 'filter blur-sm transition-all duration-300' : ''
-      }`}
-      onContextMenu={(e) => e.preventDefault()}
-    >
-      {/* SECTION 12: DIAGONAL TRACEABILITY WATERMARK FOR NON-ADMIN */}
-      <div
-        className="pointer-events-none fixed inset-0 z-30 flex items-center justify-center opacity-[0.035] rotate-[-25deg] text-slate-900 font-mono text-xl sm:text-2xl font-black select-none"
-        aria-hidden="true"
-      >
-        <div className="text-center leading-relaxed">
-          {currentUser.name} · {currentUser.id} · {watermarkTime}
-          <br />
-          NARAYANA PRODIGY CONFIDENTIAL · SCREEN CAPTURE TRACEABLE
+    <>
+      {/* SECTION 12: FULL BLACK PRIVACY SHIELD (Covers 100% of screen on blur / tab switch / capture shortcut) */}
+      {privacyShieldActive && (
+        <div
+          className="fixed inset-0 z-[100] bg-slate-950 text-white flex flex-col items-center justify-center p-6 text-center select-none"
+          onContextMenu={(e) => e.preventDefault()}
+        >
+          <div className="max-w-md w-full bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-2xl space-y-4">
+            <div className="w-14 h-14 rounded-2xl bg-rose-500/15 border border-rose-500/30 flex items-center justify-center mx-auto">
+              {isCaptureBlocked ? (
+                <ShieldAlert className="w-7 h-7 text-rose-400" />
+              ) : (
+                <Lock className="w-7 h-7 text-amber-400" />
+              )}
+            </div>
+            <div>
+              <p className="text-[11px] font-mono uppercase tracking-widest text-amber-400">
+                Narayana Prodigy · Privacy Shield Active
+              </p>
+              <h2 className="text-lg font-black mt-1">
+                {isCaptureBlocked ? 'Screen Capture Blocked & Logged' : 'Protected Session Hidden'}
+              </h2>
+              <p className="text-xs text-slate-300 mt-1.5">
+                {shieldMessage ||
+                  'Student phone numbers and records are automatically shielded whenever you switch tabs or leave this window.'}
+              </p>
+            </div>
+            <div className="text-[11px] font-mono text-slate-400 bg-slate-950/70 rounded-lg py-2 px-3 border border-slate-800">
+              {currentUser.name} · {watermarkTime}
+            </div>
+            {!isCaptureBlocked && (
+              <button
+                type="button"
+                onClick={() => {
+                  setIsWindowBlurred(false);
+                  setShieldMessage('');
+                }}
+                className="px-4 py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs rounded-lg cursor-pointer"
+              >
+                Click to Resume CRM Window
+              </button>
+            )}
+          </div>
         </div>
-      </div>
+      )}
+
+      <div
+        className={`non-admin-protected print:hidden min-h-screen bg-slate-50/70 py-6 px-4 sm:px-6 lg:px-8 space-y-6 select-none relative transition-opacity duration-150 ${
+          privacyShieldActive ? 'opacity-0 pointer-events-none' : 'opacity-100'
+        }`}
+        onContextMenu={(e) => e.preventDefault()}
+        onCopy={(e) => e.preventDefault()}
+        onCut={(e) => e.preventDefault()}
+      >
+        {/* SECTION 12: CLEAR TILED DIAGONAL FORENSIC WATERMARK FOR NON-ADMIN */}
+        <div
+          className="pointer-events-none fixed inset-0 z-30 overflow-hidden opacity-[0.13] select-none flex flex-col justify-evenly items-center"
+          aria-hidden="true"
+        >
+          {[0, 1, 2, 3].map((rowIdx) => (
+            <div
+              key={rowIdx}
+              className="whitespace-nowrap rotate-[-22deg] text-slate-900 font-mono text-sm sm:text-base font-extrabold tracking-wide flex gap-16"
+            >
+              <span>
+                {currentUser.name} ({currentUser.id}) · {watermarkTime} · NARAYANA CONFIDENTIAL
+              </span>
+              <span>
+                {currentUser.name} ({currentUser.id}) · {watermarkTime} · SCREEN CAPTURE TRACEABLE
+              </span>
+            </div>
+          ))}
+        </div>
 
       {/* TOAST MESSAGE */}
       {toastMessage && (
@@ -1230,5 +1374,6 @@ export const MentorWorkstation: React.FC<MentorWorkstationProps> = ({
         </div>
       )}
     </div>
+    </>
   );
 };

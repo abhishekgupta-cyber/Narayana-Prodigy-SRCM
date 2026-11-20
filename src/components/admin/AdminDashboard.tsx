@@ -1866,16 +1866,29 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 </thead>
                 <tbody className="divide-y divide-slate-200">
                   {auditLogs.map((a) => (
-                    <tr key={a.id} className="hover:bg-slate-50">
+                    <tr
+                      key={a.id}
+                      className={a.action === 'SECURITY_ALERT' ? 'bg-rose-50/70 hover:bg-rose-50' : 'hover:bg-slate-50'}
+                    >
                       <td className="py-3 px-4 font-mono text-slate-600">{formatISTDateTime(a.created_at)}</td>
                       <td className="py-3 px-4 font-bold text-slate-900">{a.user_name}</td>
                       <td className="py-3 px-4">
-                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-slate-100 text-slate-800">
+                        <span
+                          className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                            a.action === 'SECURITY_ALERT'
+                              ? 'bg-rose-100 text-rose-800 border border-rose-300'
+                              : a.action === 'UNMASK_PHONE'
+                              ? 'bg-amber-100 text-amber-800'
+                              : 'bg-slate-100 text-slate-800'
+                          }`}
+                        >
                           {a.action}
                         </span>
                       </td>
                       <td className="py-3 px-4">{a.entity}</td>
-                      <td className="py-3 px-4 font-mono">{a.entity_id}</td>
+                      <td className="py-3 px-4 font-mono text-slate-700">
+                        {a.meta?.detail || a.entity_id}
+                      </td>
                     </tr>
                   ))}
                 </tbody>
