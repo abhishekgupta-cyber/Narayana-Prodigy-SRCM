@@ -32,11 +32,12 @@
   {
     "id": "mentor-abhishek-gupta-sir",
     "name": "Abhishek Gupta sir",
-    "email": "abhishek.gupta.sir@narayanagroup.com",
+    "email": "abhishekgupta85050@gmail.com",
     "role": "MENTOR",
     "department": "Prodigy Academic Operations",
     "daily_call_goal": 0,
-    "mobile_number": "+91 9684820587"
+    "mobile_number": "+91 7331166957",
+    "password_hash": "$v1$ah2r1c1ttrrl$664ed3856a94b8b9"
   },
   {
     "id": "mentor-arun-chaubey-sir",
