@@ -6,16 +6,18 @@
     "role": "SUPER_ADMIN",
     "department": "National Academic Operations & Relations",
     "daily_call_goal": 0,
-    "mobile_number": "+91 76118 70213"
+    "mobile_number": "+91 76118 70213",
+    "password_hash": "$v1$ydi20unqrw0z$af1bff456dee8739"
   },
   {
     "id": "admin-himani",
     "name": "Himani",
-    "email": "himani@narayanagroup.com",
+    "email": "himanibajaj@narayanagroup.com",
     "role": "SUPER_ADMIN",
-    "department": "National Academic Operations ",
+    "department": "National Academic Operations",
     "daily_call_goal": 0,
-    "mobile_number": "+91 97722 32480"
+    "mobile_number": "+91 97722 32480",
+    "password_hash": "$v1$1oqbsx1jch0i$7cc21145073d26b9"
   },
   {
     "id": "mentor-rohit-yogi-sir",
@@ -24,7 +26,8 @@
     "role": "MENTOR",
     "department": "Prodigy Markiting & Operation",
     "daily_call_goal": 60,
-    "mobile_number": "+91 9179111680"
+    "mobile_number": "+91 9179111680",
+    "password_hash": "$v1$eip69hlfsjmz$02b965c591939db9"
   },
   {
     "id": "mentor-abhishek-gupta-sir",
@@ -222,7 +225,8 @@
     "role": "SUPER_ADMIN",
     "department": "National Academic Operations & Relations Head",
     "daily_call_goal": 0,
-    "mobile_number": "+91 95105 45694"
+    "mobile_number": "+91 95105 45694",
+    "password_hash": "$v1$nwem0rdqs67v$1bfe0805ed3c9939"
   },
   {
     "id": "mentor-ashish-thorecha-sir",
@@ -240,7 +244,8 @@
     "role": "SUPER_ADMIN",
     "department": "National Academic Head",
     "daily_call_goal": 0,
-    "mobile_number": "+91 77370 65449"
+    "mobile_number": "+91 77370 65449",
+    "password_hash": "$v1$kps1y7zcsaih$24896f45f95ff4b9"
   },
   {
     "id": "mentor-akash-goyal-sir",
@@ -270,4 +275,3 @@
     "mobile_number": "+91 9424176250"
   }
 ]
- 
