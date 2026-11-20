@@ -52,11 +52,12 @@
   {
     "id": "mentor-akansha-yadav-maam",
     "name": "Akansha Yadav maam",
-    "email": "akansha.yadav.maam@narayanagroup.com",
+    "email": "aakanshayadav@narayanagroup.com",
     "role": "MENTOR",
     "department": "Prodigy Markiting & Operation",
     "daily_call_goal": 60,
-    "mobile_number": "+91 9153410440"
+    "mobile_number": "+91 9905252529",
+    "password_hash": "$v1$zdkgoa692gh7$829f6245a51483b9"
   },
   {
     "id": "mentor-basarat-ansari-sir",
