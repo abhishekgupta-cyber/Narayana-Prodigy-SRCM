@@ -399,6 +399,16 @@ class CRMDatabase {
     return data;
   }
 
+  public async exportDefaultUsersCode(): Promise<any[]> {
+    if (typeof window === 'undefined' || !this.authToken) throw new Error('Not authenticated');
+    const res = await fetch('/api/admin/export-default-users', {
+      headers: { Authorization: `Bearer ${this.authToken}` },
+    });
+    const data = await res.json().catch(() => []);
+    if (!res.ok) throw new Error(data?.error || 'Failed to export defaultUsers.json');
+    return data;
+  }
+
   public async restoreServerBackup(backupJson: any): Promise<{ version: number; usersCount: number }> {
     if (typeof window === 'undefined' || !this.authToken) throw new Error('Not authenticated');
     const res = await fetch('/api/admin/restore-state', {

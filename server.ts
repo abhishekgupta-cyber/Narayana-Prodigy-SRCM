@@ -20,7 +20,7 @@ const SECRET_FILE = path.join(DATA_DIR, '.session-secret');
 const DEFAULT_USERS_FILE = path.join(process.cwd(), 'src', 'data', 'defaultUsers.json');
 const REAL_ADMISSIONS_FILE = path.join(process.cwd(), 'src', 'data', 'realAdmissions.json');
 const DATABASE_URL = process.env.DATABASE_URL?.trim() || '';
-const APP_VERSION = '2.0.0';
+const APP_VERSION = '2.1.0';
 
 // ---------------------------------------------------------------------------
 // IST Date & Security Helpers (matches src/services/antiCheat.ts & db.ts)
@@ -365,6 +365,59 @@ function getDefaultUsersDigest(): string | null {
   }
 }
 
+function buildCleanDefaultUserRecord(u: any) {
+  const emailLower = String(u.email || '').trim().toLowerCase();
+  const usernameLower = String(u.username || emailLower).trim().toLowerCase();
+  const out: Record<string, any> = {
+    id: u.id,
+    name: String(u.name || '').trim(),
+    email: emailLower,
+  };
+  if (usernameLower && usernameLower !== emailLower) {
+    out.username = usernameLower;
+  }
+  out.role = u.role || 'MENTOR';
+  out.department = String(u.department || '').trim();
+  out.daily_call_goal = Number(u.daily_call_goal ?? (out.role === 'SUPER_ADMIN' ? 0 : 60));
+  if (u.mobile_number !== undefined && u.mobile_number !== '') {
+    out.mobile_number = String(u.mobile_number).trim();
+  }
+  if (u.status && u.status !== 'ACTIVE') {
+    out.status = u.status;
+  }
+  if (u.must_change_password) {
+    out.must_change_password = true;
+  }
+  if (u.password_hash) {
+    out.password_hash = u.password_hash;
+  }
+  return out;
+}
+
+function syncStateUsersToDefaultUsersFile(state: ServerCRMState): boolean {
+  try {
+    const cleanList = state.users.map(buildCleanDefaultUserRecord);
+    const jsonText = JSON.stringify(cleanList, null, 2) + '\n';
+    const nextDigest = crypto.createHash('sha256').update(jsonText).digest('hex');
+    if (fs.existsSync(DEFAULT_USERS_FILE)) {
+      const existingText = fs.readFileSync(DEFAULT_USERS_FILE, 'utf8');
+      if (existingText === jsonText) {
+        state.defaultUsersDigest = nextDigest;
+        return false;
+      }
+    }
+    const tmpFile = `${DEFAULT_USERS_FILE}.tmp-${Date.now()}`;
+    fs.writeFileSync(tmpFile, jsonText, 'utf8');
+    fs.renameSync(tmpFile, DEFAULT_USERS_FILE);
+    state.defaultUsersDigest = nextDigest;
+    return true;
+  } catch (err) {
+    // Expected if running on a read-only production container
+    console.warn('[Narayana CRM] Note: Could not write defaultUsers.json on this host:', (err as any)?.message || err);
+    return false;
+  }
+}
+
 function syncDefaultUsersIntoState(state: ServerCRMState): { changed: boolean; migratedRefs: boolean } {
   if (!fs.existsSync(DEFAULT_USERS_FILE)) return { changed: false, migratedRefs: false };
   try {
@@ -412,7 +465,15 @@ function syncDefaultUsersIntoState(state: ServerCRMState): { changed: boolean; m
         existing.department = du.department;
         existing.daily_call_goal = du.daily_call_goal ?? (du.role === 'SUPER_ADMIN' ? 0 : 60);
         if (du.mobile_number !== undefined) existing.mobile_number = du.mobile_number;
-        if (!existing.status) existing.status = du.status || 'ACTIVE';
+        if (du.status) existing.status = du.status;
+        else if (!existing.status) existing.status = 'ACTIVE';
+        if (du.must_change_password !== undefined) existing.must_change_password = du.must_change_password;
+        if (du.password_hash) {
+          existing.password_hash = du.password_hash;
+          existing.password = undefined;
+          existing.failed_logins = 0;
+          existing.locked_until = undefined;
+        }
       } else {
         state.users.push({
           ...du,
@@ -575,12 +636,19 @@ async function initCloudPersistence(): Promise<void> {
         merged.version = (merged.version || 1) + 1;
       }
       serverState = merged;
+
+      let codeFileMirrored = false;
+      if (!usersSync.changed && !process.env.RENDER) {
+        codeFileMirrored = syncStateUsersToDefaultUsersFile(serverState);
+      }
       saveServerStateLocal(serverState);
 
       const missing = ALL_SECTIONS.filter((s) => !loadedSections.has(s));
-      if (missing.length > 0 || usersSync.changed) {
+      if (missing.length > 0 || usersSync.changed || codeFileMirrored) {
         const extraSections: StateSection[] = usersSync.changed
           ? ['users', 'meta', ...(usersSync.migratedRefs ? (['students', 'campaignAssignments', 'callLogs', 'externalLeads', 'campaigns'] as StateSection[]) : [])]
+          : codeFileMirrored
+          ? ['meta']
           : [];
         const toSave: StateSection[] = Array.from(new Set([...missing, ...extraSections]));
         await upsertSectionsWithRetry(
@@ -591,7 +659,7 @@ async function initCloudPersistence(): Promise<void> {
       }
 
       console.log(
-        `[Narayana CRM] Loaded state from Neon PostgreSQL (${secRes.rows.length} sections, version ${serverState.version}, ${serverState.users.length} users, ${serverState.students.length} students${usersSync.changed ? ', reconciled defaultUsers.json' : ''})`
+        `[Narayana CRM] Loaded state from Neon PostgreSQL (${secRes.rows.length} sections, version ${serverState.version}, ${serverState.users.length} users, ${serverState.students.length} students${usersSync.changed ? ', reconciled defaultUsers.json' : codeFileMirrored ? ', mirrored DB users to defaultUsers.json' : ''})`
       );
       return;
     }
@@ -815,6 +883,14 @@ async function startServer() {
     });
   });
 
+  app.get('/api/admin/export-default-users', requireAuth, (req: AuthedRequest, res) => {
+    if (req.authUser.role !== 'SUPER_ADMIN') {
+      res.status(403).json({ error: 'Forbidden: Super Admin access required.' });
+      return;
+    }
+    res.json(serverState.users.map(buildCleanDefaultUserRecord));
+  });
+
   app.post('/api/admin/restore-state', requireAuth, async (req: AuthedRequest, res) => {
     if (req.authUser.role !== 'SUPER_ADMIN') {
       res.status(403).json({ error: 'Forbidden: Super Admin access required.' });
@@ -829,6 +905,7 @@ async function startServer() {
       ...incoming,
       version: Math.max(serverState.version + 1, Number(incoming.version || 1) + 1),
     };
+    syncStateUsersToDefaultUsersFile(serverState);
     appendAudit({
       user_name: req.authUser.name,
       user_role: req.authUser.role,
@@ -1140,7 +1217,8 @@ async function startServer() {
           });
 
           broadcastStateChanged(action, user.id, [mentorId]);
-          res.json({ ok: true, version: serverState.version });
+          await flushPostgresPersistence();
+          res.json({ ok: true, version: serverState.version, persistedToCloud: Boolean(pgPool) });
           return;
         }
 
@@ -1211,7 +1289,8 @@ async function startServer() {
           });
 
           broadcastStateChanged(action, user.id, [call.mentor_id]);
-          res.json({ ok: true, version: serverState.version });
+          await flushPostgresPersistence();
+          res.json({ ok: true, version: serverState.version, persistedToCloud: Boolean(pgPool) });
           return;
         }
 
@@ -1240,6 +1319,7 @@ async function startServer() {
             created_at: payload.created_at || nowIso,
           };
           serverState.users.push(newUser);
+          const codeSynced = syncStateUsersToDefaultUsersFile(serverState);
           appendAudit({
             user_name: user.name,
             user_role: user.role,
@@ -1250,7 +1330,7 @@ async function startServer() {
           });
           broadcastStateChanged(action, user.id);
           await flushPostgresPersistence();
-          res.json({ ok: true, version: serverState.version, user: sanitizeUserForClient(newUser), persistedToCloud: Boolean(pgPool) });
+          res.json({ ok: true, version: serverState.version, user: sanitizeUserForClient(newUser), persistedToCloud: Boolean(pgPool), syncedToCode: codeSynced });
           return;
         }
 
@@ -1283,6 +1363,7 @@ async function startServer() {
             partial.password = undefined;
           }
           serverState.users[idx] = { ...serverState.users[idx], ...partial };
+          const codeSynced = syncStateUsersToDefaultUsersFile(serverState);
           wsClients.forEach((client) => {
             if (client.userId === payload.id) {
               client.role = serverState.users[idx].role;
@@ -1306,7 +1387,7 @@ async function startServer() {
           });
           broadcastStateChanged(action, user.id, [payload.id]);
           await flushPostgresPersistence();
-          res.json({ ok: true, version: serverState.version, user: sanitizeUserForClient(serverState.users[idx]), persistedToCloud: Boolean(pgPool) });
+          res.json({ ok: true, version: serverState.version, user: sanitizeUserForClient(serverState.users[idx]), persistedToCloud: Boolean(pgPool), syncedToCode: codeSynced });
           return;
         }
 
@@ -1327,6 +1408,7 @@ async function startServer() {
           }
           const removed = serverState.users[targetIdx];
           serverState.users.splice(targetIdx, 1);
+          const codeSynced = syncStateUsersToDefaultUsersFile(serverState);
           wsClients.forEach((client) => {
             if (client.userId === targetId) {
               try { client.ws.close(4001, 'Account deleted'); } catch {}
@@ -1342,7 +1424,7 @@ async function startServer() {
           });
           broadcastStateChanged(action, user.id);
           await flushPostgresPersistence();
-          res.json({ ok: true, version: serverState.version, persistedToCloud: Boolean(pgPool) });
+          res.json({ ok: true, version: serverState.version, persistedToCloud: Boolean(pgPool), syncedToCode: codeSynced });
           return;
         }
 
@@ -1364,6 +1446,7 @@ async function startServer() {
           };
           serverState.campaigns.unshift(newCamp);
           broadcastStateChanged(action, user.id);
+          await flushPostgresPersistence();
           res.json({ ok: true, version: serverState.version, campaign: newCamp });
           return;
         }
@@ -1376,6 +1459,7 @@ async function startServer() {
           }
           serverState.campaigns[idx] = { ...serverState.campaigns[idx], ...(payload.partial || {}) };
           broadcastStateChanged(action, user.id);
+          await flushPostgresPersistence();
           res.json({ ok: true, version: serverState.version });
           return;
         }
@@ -1395,6 +1479,7 @@ async function startServer() {
             entity_id: payload.id,
           });
           broadcastStateChanged(action, user.id);
+          await flushPostgresPersistence();
           res.json({ ok: true, version: serverState.version });
           return;
         }
@@ -1446,6 +1531,7 @@ async function startServer() {
           });
 
           broadcastStateChanged(action, user.id, mentorIds);
+          await flushPostgresPersistence();
           res.json({ ok: true, version: serverState.version, assignedCount: admissionNos.length });
           return;
         }
@@ -1456,6 +1542,7 @@ async function startServer() {
             if (leadIds.includes(l.id)) l.assigned_to = payload.mentorId;
           });
           broadcastStateChanged(action, user.id, payload.mentorId ? [payload.mentorId] : undefined);
+          await flushPostgresPersistence();
           res.json({ ok: true, version: serverState.version });
           return;
         }
@@ -1464,6 +1551,7 @@ async function startServer() {
           const incoming: any[] = Array.isArray(payload.leads) ? payload.leads : [];
           serverState.externalLeads = [...incoming, ...serverState.externalLeads];
           broadcastStateChanged(action, user.id);
+          await flushPostgresPersistence();
           res.json({ ok: true, version: serverState.version });
           return;
         }
@@ -1477,6 +1565,7 @@ async function startServer() {
           });
           serverState.students = processInitialStudents(serverState.students);
           broadcastStateChanged(action, user.id);
+          await flushPostgresPersistence();
           res.json({ ok: true, version: serverState.version });
           return;
         }
@@ -1485,6 +1574,7 @@ async function startServer() {
           const results: any[] = Array.isArray(payload.results) ? payload.results : [];
           serverState.exams = [...results, ...serverState.exams];
           broadcastStateChanged(action, user.id);
+          await flushPostgresPersistence();
           res.json({ ok: true, version: serverState.version });
           return;
         }
@@ -1493,6 +1583,7 @@ async function startServer() {
           const records: any[] = Array.isArray(payload.records) ? payload.records : [];
           serverState.attendance = [...records, ...serverState.attendance];
           broadcastStateChanged(action, user.id);
+          await flushPostgresPersistence();
           res.json({ ok: true, version: serverState.version });
           return;
         }
@@ -1500,6 +1591,7 @@ async function startServer() {
         case 'BATCH_RECORD': {
           if (payload.batch) serverState.uploadBatches.unshift(payload.batch);
           broadcastStateChanged(action, user.id);
+          await flushPostgresPersistence();
           res.json({ ok: true, version: serverState.version });
           return;
         }
@@ -1527,6 +1619,7 @@ async function startServer() {
             entity_id: payload.batchId,
           });
           broadcastStateChanged(action, user.id);
+          await flushPostgresPersistence();
           res.json({ ok: true, version: serverState.version });
           return;
         }
@@ -1542,6 +1635,7 @@ async function startServer() {
             meta: payload.partial,
           });
           broadcastStateChanged(action, user.id);
+          await flushPostgresPersistence();
           res.json({ ok: true, version: serverState.version });
           return;
         }
@@ -1551,6 +1645,7 @@ async function startServer() {
             serverState.activeSessionId = payload.id;
           }
           broadcastStateChanged(action, user.id);
+          await flushPostgresPersistence();
           res.json({ ok: true, version: serverState.version });
           return;
         }
@@ -1558,6 +1653,7 @@ async function startServer() {
         case 'SESSION_ADD': {
           if (payload.session) serverState.sessions.push(payload.session);
           broadcastStateChanged(action, user.id);
+          await flushPostgresPersistence();
           res.json({ ok: true, version: serverState.version });
           return;
         }

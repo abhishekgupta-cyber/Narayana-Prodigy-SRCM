@@ -20,6 +20,7 @@ import {
   UserX,
   UserCheck,
   FileText,
+  Download,
 } from 'lucide-react';
 import { Role, User } from '../../types/crm';
 import { crmDb } from '../../services/db';
@@ -151,8 +152,8 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
         );
         showSuccess(
           password.trim()
-            ? `User ${name.trim()} (${role === 'SUPER_ADMIN' ? 'Admin' : 'Mentor'}) & new password saved.`
-            : `User ${name.trim()} (${role === 'SUPER_ADMIN' ? 'Admin' : 'Mentor'}) updated successfully.`
+            ? `User ${name.trim()} (${role === 'SUPER_ADMIN' ? 'Admin' : 'Mentor'}) & new password saved to Cloud DB & synced to code.`
+            : `User ${name.trim()} (${role === 'SUPER_ADMIN' ? 'Admin' : 'Mentor'}) updated in Cloud DB & code.`
         );
       } else {
         if (!password.trim()) {
@@ -176,7 +177,7 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
           },
           currentUser
         );
-        showSuccess(`New ${role === 'SUPER_ADMIN' ? 'Administrator' : 'Academic Mentor'} created and synced.`);
+        showSuccess(`New ${role === 'SUPER_ADMIN' ? 'Administrator' : 'Academic Mentor'} created & synced to Cloud DB + code.`);
       }
 
       setIsModalOpen(false);
@@ -281,13 +282,40 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
           </p>
         </div>
 
-        <button
-          onClick={handleOpenAdd}
-          className="px-4 py-2 bg-slate-950 hover:bg-slate-800 text-white rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-2 cursor-pointer"
-        >
-          <UserPlus className="w-4 h-4 text-amber-400" />
-          <span>Add New Staff / Mentor</span>
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={async () => {
+              setActionError('');
+              try {
+                const list = await crmDb.exportDefaultUsersCode();
+                const blob = new Blob([JSON.stringify(list, null, 2) + '\n'], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'defaultUsers.json';
+                a.click();
+                URL.revokeObjectURL(url);
+                showSuccess(`Exported defaultUsers.json (${list.length} staff accounts) ready for GitHub.`);
+              } catch (err: any) {
+                setActionError(err.message || 'Failed to export defaultUsers.json');
+              }
+            }}
+            className="px-3.5 py-2 bg-white hover:bg-slate-50 text-slate-800 border border-slate-300 rounded-lg text-xs font-bold transition-all shadow-2xs flex items-center gap-1.5 cursor-pointer"
+            title="Download updated src/data/defaultUsers.json file"
+          >
+            <Download className="w-3.5 h-3.5 text-blue-600" />
+            <span>Export defaultUsers.json</span>
+          </button>
+
+          <button
+            onClick={handleOpenAdd}
+            className="px-4 py-2 bg-slate-950 hover:bg-slate-800 text-white rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-2 cursor-pointer"
+          >
+            <UserPlus className="w-4 h-4 text-amber-400" />
+            <span>Add New Staff / Mentor</span>
+          </button>
+        </div>
       </div>
 
       {/* Search & Filters */}

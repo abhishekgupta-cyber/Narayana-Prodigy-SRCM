@@ -410,7 +410,7 @@ export const Navbar: React.FC<NavbarProps> = ({
 
             {/* Drawer Footer */}
             <div className="p-3 bg-slate-50 border-t border-slate-200 text-center text-[10px] text-slate-500">
-              Narayana Prodigy CRM · v2.0.0
+              Narayana Prodigy CRM · v2.1.0
             </div>
           </div>
         </div>
