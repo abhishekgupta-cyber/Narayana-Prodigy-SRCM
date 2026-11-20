@@ -20,7 +20,7 @@ const SECRET_FILE = path.join(DATA_DIR, '.session-secret');
 const DEFAULT_USERS_FILE = path.join(process.cwd(), 'src', 'data', 'defaultUsers.json');
 const REAL_ADMISSIONS_FILE = path.join(process.cwd(), 'src', 'data', 'realAdmissions.json');
 const DATABASE_URL = process.env.DATABASE_URL?.trim() || '';
-const APP_VERSION = '2.1.0';
+const APP_VERSION = '2.2.0';
 
 // ---------------------------------------------------------------------------
 // IST Date & Security Helpers (matches src/services/antiCheat.ts & db.ts)
@@ -324,6 +324,9 @@ function applySectionPayload(target: ServerCRMState, section: StateSection, payl
 
 let pgPool: Pool | null = null;
 let pgPersistChain: Promise<void> = Promise.resolve();
+let pgWriteInFlightCount = 0;
+let isExternalPgSyncRunning = false;
+const sectionUpdatedAt = new Map<StateSection, number>();
 
 function createPgPoolIfConfigured(): Pool | null {
   if (!DATABASE_URL) return null;
@@ -338,8 +341,8 @@ function createPgPoolIfConfigured(): Pool | null {
     const pool = new Pool({
       connectionString: normalizedUrl,
       ssl: isLocalhost ? undefined : isNeonHost ? undefined : { rejectUnauthorized: false },
-      max: 5,
-      idleTimeoutMillis: 20000,
+      max: 15,
+      idleTimeoutMillis: 30000,
       connectionTimeoutMillis: 15000,
     });
 
@@ -416,6 +419,108 @@ function syncStateUsersToDefaultUsersFile(state: ServerCRMState): boolean {
     console.warn('[Narayana CRM] Note: Could not write defaultUsers.json on this host:', (err as any)?.message || err);
     return false;
   }
+}
+
+let githubSyncChain: Promise<void> = Promise.resolve();
+let lastGithubSyncStatus: { status: 'idle' | 'ok' | 'error' | 'disabled'; message: string; at?: string } = {
+  status: getGitHubSyncConfig() ? 'idle' : 'disabled',
+  message: getGitHubSyncConfig() ? 'Ready to sync' : 'Optional GITHUB_TOKEN / GITHUB_REPO not set',
+};
+
+function getGitHubSyncConfig(): { token: string; repo: string; branch: string } | null {
+  const token = (process.env.GITHUB_TOKEN || '').trim();
+  const rawRepo = (process.env.GITHUB_REPO || '').trim();
+  const branch = (process.env.GITHUB_BRANCH || 'main').trim() || 'main';
+  if (!token || !rawRepo) return null;
+
+  const cleanedRepo = rawRepo
+    .replace(/^https?:\/\/github\.com\//i, '')
+    .replace(/\.git$/i, '')
+    .replace(/^\/+|\/+$/g, '');
+  if (!cleanedRepo.includes('/')) return null;
+
+  return { token, repo: cleanedRepo, branch };
+}
+
+function syncDefaultUsersToGitHubIfConfigured(
+  state: ServerCRMState
+): Promise<{ status: string; message: string }> {
+  const cfg = getGitHubSyncConfig();
+  if (!cfg) {
+    lastGithubSyncStatus = { status: 'disabled', message: 'GITHUB_TOKEN / GITHUB_REPO not configured on this host' };
+    return Promise.resolve(lastGithubSyncStatus);
+  }
+
+  const cleanList = state.users.map(buildCleanDefaultUserRecord);
+  const jsonText = JSON.stringify(cleanList, null, 2) + '\n';
+
+  let result: { status: 'ok' | 'error'; message: string } = { status: 'ok', message: 'Pending' };
+
+  const task = githubSyncChain
+    .then(async () => {
+      const apiUrl = `https://api.github.com/repos/${cfg.repo}/contents/src/data/defaultUsers.json`;
+      const headers: Record<string, string> = {
+        Authorization: `Bearer ${cfg.token}`,
+        Accept: 'application/vnd.github+json',
+        'User-Agent': 'Narayana-Prodigy-CRM-Sync',
+        'Content-Type': 'application/json',
+      };
+
+      const getRes = await fetch(`${apiUrl}?ref=${encodeURIComponent(cfg.branch)}`, { headers });
+      let existingSha: string | undefined;
+      if (getRes.ok) {
+        const fileData = (await getRes.json()) as { sha?: string; content?: string };
+        existingSha = fileData?.sha;
+        if (fileData?.content) {
+          const decoded = Buffer.from(fileData.content.replace(/\n/g, ''), 'base64').toString('utf8');
+          if (decoded === jsonText) {
+            result = { status: 'ok', message: `Already in sync with ${cfg.repo}@${cfg.branch}` };
+            lastGithubSyncStatus = { ...result, at: new Date().toISOString() };
+            return;
+          }
+        }
+      } else if (getRes.status !== 404) {
+        const errTxt = await getRes.text().catch(() => '');
+        const msg = `GitHub read failed (${getRes.status}): ${errTxt.slice(0, 120)}`;
+        console.warn('[Narayana CRM]', msg);
+        result = { status: 'error', message: msg };
+        lastGithubSyncStatus = { ...result, at: new Date().toISOString() };
+        return;
+      }
+
+      const putRes = await fetch(apiUrl, {
+        method: 'PUT',
+        headers,
+        body: JSON.stringify({
+          message: `chore(crm): auto-sync ${cleanList.length} staff accounts from live CRM`,
+          content: Buffer.from(jsonText, 'utf8').toString('base64'),
+          ...(existingSha ? { sha: existingSha } : {}),
+          branch: cfg.branch,
+        }),
+      });
+
+      if (!putRes.ok) {
+        const errTxt = await putRes.text().catch(() => '');
+        const msg = `GitHub commit failed (${putRes.status}): ${errTxt.slice(0, 120)}`;
+        console.warn('[Narayana CRM]', msg);
+        result = { status: 'error', message: msg };
+        lastGithubSyncStatus = { ...result, at: new Date().toISOString() };
+      } else {
+        const msg = `Committed ${cleanList.length} staff to ${cfg.repo}@${cfg.branch}`;
+        console.log(`[Narayana CRM] ${msg}`);
+        result = { status: 'ok', message: msg };
+        lastGithubSyncStatus = { ...result, at: new Date().toISOString() };
+      }
+    })
+    .catch((err) => {
+      const msg = `GitHub sync error: ${(err as any)?.message || err}`;
+      console.warn('[Narayana CRM]', msg);
+      result = { status: 'error', message: msg };
+      lastGithubSyncStatus = { ...result, at: new Date().toISOString() };
+    });
+
+  githubSyncChain = task;
+  return task.then(() => result);
 }
 
 function syncDefaultUsersIntoState(state: ServerCRMState): { changed: boolean; migratedRefs: boolean } {
@@ -561,14 +666,21 @@ async function upsertSectionsWithRetry(pool: Pool, names: string[], payloads: st
     SELECT s, p, NOW()
     FROM unnest($1::text[], $2::jsonb[]) AS t(s, p)
     ON CONFLICT (section) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()
+    RETURNING section, (EXTRACT(EPOCH FROM updated_at) * 1000)::double precision AS ts_ms
   `;
+  let res;
   try {
-    await pool.query(query, [names, payloads]);
+    res = await pool.query(query, [names, payloads]);
   } catch {
     // Handle Neon scale-to-zero wakeup transient failure with a single retry
     await new Promise((r) => setTimeout(r, 600));
-    await pool.query(query, [names, payloads]);
+    res = await pool.query(query, [names, payloads]);
   }
+  res?.rows?.forEach((row: any) => {
+    if (row?.section && row?.ts_ms !== undefined) {
+      sectionUpdatedAt.set(row.section as StateSection, Number(row.ts_ms));
+    }
+  });
 }
 
 function persistStateToPostgres(state: ServerCRMState, sections: StateSection[] = ALL_SECTIONS) {
@@ -577,6 +689,7 @@ function persistStateToPostgres(state: ServerCRMState, sections: StateSection[] 
   const names = uniqueSections;
   const payloads = uniqueSections.map((sec) => JSON.stringify(extractSectionPayload(state, sec)));
 
+  pgWriteInFlightCount += 1;
   pgPersistChain = pgPersistChain
     .then(async () => {
       if (!pgPool) return;
@@ -584,6 +697,9 @@ function persistStateToPostgres(state: ServerCRMState, sections: StateSection[] 
     })
     .catch((err) => {
       console.error('[Narayana CRM] PostgreSQL save error:', err);
+    })
+    .finally(() => {
+      pgWriteInFlightCount = Math.max(0, pgWriteInFlightCount - 1);
     });
 }
 
@@ -619,7 +735,10 @@ async function initCloudPersistence(): Promise<void> {
       );
     `);
 
-    const secRes = await pgPool.query(`SELECT section, payload FROM crm_state_sections`);
+    const secRes = await pgPool.query(`
+      SELECT section, payload, (EXTRACT(EPOCH FROM updated_at) * 1000)::double precision AS ts_ms
+      FROM crm_state_sections
+    `);
     if (secRes.rows.length > 0) {
       const merged = createSeedState();
       merged.defaultUsersDigest = undefined;
@@ -628,6 +747,9 @@ async function initCloudPersistence(): Promise<void> {
         if (ALL_SECTIONS.includes(row.section)) {
           applySectionPayload(merged, row.section as StateSection, row.payload);
           loadedSections.add(row.section);
+          if (row.ts_ms !== undefined) {
+            sectionUpdatedAt.set(row.section as StateSection, Number(row.ts_ms));
+          }
         }
       });
 
@@ -687,6 +809,125 @@ async function initCloudPersistence(): Promise<void> {
   } catch (err) {
     console.error('[Narayana CRM] PostgreSQL initialization failed, falling back to local JSON:', err);
     pgPool = null;
+  }
+}
+
+async function checkLocalDefaultUsersFileEdit(): Promise<boolean> {
+  if (process.env.RENDER || pgWriteInFlightCount > 0) return false;
+  const diskDigest = getDefaultUsersDigest();
+  if (!diskDigest || diskDigest === serverState.defaultUsersDigest) return false;
+  const res = syncDefaultUsersIntoState(serverState);
+  if (!res.changed) return false;
+
+  serverState.version += 1;
+  const dirty: StateSection[] = res.migratedRefs
+    ? ['meta', 'users', 'students', 'campaignAssignments', 'callLogs', 'externalLeads', 'campaigns']
+    : ['meta', 'users'];
+  saveServerState(serverState, dirty);
+  await flushPostgresPersistence();
+  void syncDefaultUsersToGitHubIfConfigured(serverState);
+
+  const payloadMsg = JSON.stringify({
+    type: 'CRM_STATE_CHANGED',
+    version: serverState.version,
+    action: 'CODE_USERS_FILE_SYNC',
+    actorId: 'code-watcher',
+    timestamp: new Date().toISOString(),
+  });
+  wsClients.forEach((client) => {
+    if (client.ws.readyState === WebSocket.OPEN) {
+      client.ws.send(payloadMsg);
+    }
+  });
+  return true;
+}
+
+async function syncExternalChangesFromPostgres(): Promise<void> {
+  if (isExternalPgSyncRunning || pgWriteInFlightCount > 0) return;
+  isExternalPgSyncRunning = true;
+  try {
+    if (pgPool) {
+      const tsRes = await pgPool.query(`
+        SELECT section, (EXTRACT(EPOCH FROM updated_at) * 1000)::double precision AS ts_ms
+        FROM crm_state_sections
+      `);
+      if (pgWriteInFlightCount > 0) return;
+
+      const changedSections: StateSection[] = [];
+      tsRes.rows.forEach((row: any) => {
+        const sec = row.section as StateSection;
+        if (!ALL_SECTIONS.includes(sec)) return;
+        const remoteTs = Number(row.ts_ms || 0);
+        const knownTs = sectionUpdatedAt.get(sec) || 0;
+        if (remoteTs > knownTs + 10) {
+          changedSections.push(sec);
+        }
+      });
+
+      if (changedSections.length > 0) {
+        const dataRes = await pgPool.query(
+          `SELECT section, payload, (EXTRACT(EPOCH FROM updated_at) * 1000)::double precision AS ts_ms
+           FROM crm_state_sections
+           WHERE section = ANY($1::text[])`,
+          [changedSections]
+        );
+        if (pgWriteInFlightCount > 0 || dataRes.rows.length === 0) return;
+
+        const prevVersion = serverState.version;
+        let usersUpdated = false;
+
+        dataRes.rows.forEach((row: any) => {
+          const sec = row.section as StateSection;
+          if (!ALL_SECTIONS.includes(sec)) return;
+          applySectionPayload(serverState, sec, row.payload);
+          if (row.ts_ms !== undefined) {
+            sectionUpdatedAt.set(sec, Number(row.ts_ms));
+          }
+          if (sec === 'users') usersUpdated = true;
+        });
+
+        serverState.version = Math.max(prevVersion + 1, serverState.version);
+
+        if (usersUpdated) {
+          wsClients.forEach((client) => {
+            const latestUser = serverState.users.find((u) => u.id === client.userId);
+            if (!latestUser || latestUser.status === 'INACTIVE') {
+              try { client.ws.close(4001, 'Account deactivated'); } catch {}
+            } else {
+              client.role = latestUser.role;
+            }
+          });
+          if (!process.env.RENDER) {
+            syncStateUsersToDefaultUsersFile(serverState);
+          }
+        }
+
+        saveServerStateLocal(serverState);
+
+        const payloadMsg = JSON.stringify({
+          type: 'CRM_STATE_CHANGED',
+          version: serverState.version,
+          action: 'EXTERNAL_CLOUD_SYNC',
+          actorId: 'cloud-sync',
+          timestamp: new Date().toISOString(),
+        });
+        wsClients.forEach((client) => {
+          if (client.ws.readyState === WebSocket.OPEN) {
+            client.ws.send(payloadMsg);
+          }
+        });
+        return;
+      }
+    }
+
+    await checkLocalDefaultUsersFileEdit();
+  } catch (err: any) {
+    // Transient wakeup errors are expected when Neon pauses compute; next poll recovers cleanly
+    if (err?.message && !String(err.message).includes('timeout')) {
+      console.warn('[Narayana CRM] Cloud poll notice:', err.message);
+    }
+  } finally {
+    isExternalPgSyncRunning = false;
   }
 }
 
@@ -867,7 +1108,32 @@ async function startServer() {
       appVersion: APP_VERSION,
       version: serverState.version,
       persistenceMode: pgPool ? 'POSTGRESQL_CLOUD' : 'LOCAL_JSON',
+      hostEnvironment: process.env.RENDER ? 'RENDER' : 'AI_STUDIO_OR_LOCAL',
+      githubSyncConfigured: Boolean(getGitHubSyncConfig()),
+      lastGithubSyncStatus,
       time: new Date().toISOString(),
+    });
+  });
+
+  app.post('/api/admin/sync-now', requireAuth, async (req: AuthedRequest, res) => {
+    if (req.authUser.role !== 'SUPER_ADMIN') {
+      res.status(403).json({ error: 'Forbidden: Super Admin access required.' });
+      return;
+    }
+    await syncExternalChangesFromPostgres();
+    if (!process.env.RENDER) {
+      syncStateUsersToDefaultUsersFile(serverState);
+    }
+    const ghResult = await syncDefaultUsersToGitHubIfConfigured(serverState);
+    res.json({
+      ok: true,
+      appVersion: APP_VERSION,
+      version: serverState.version,
+      usersCount: serverState.users.length,
+      persistenceMode: pgPool ? 'POSTGRESQL_CLOUD' : 'LOCAL_JSON',
+      hostEnvironment: process.env.RENDER ? 'RENDER' : 'AI_STUDIO_OR_LOCAL',
+      githubSyncConfigured: Boolean(getGitHubSyncConfig()),
+      lastGithubSyncStatus: ghResult,
     });
   });
 
@@ -906,6 +1172,7 @@ async function startServer() {
       version: Math.max(serverState.version + 1, Number(incoming.version || 1) + 1),
     };
     syncStateUsersToDefaultUsersFile(serverState);
+    void syncDefaultUsersToGitHubIfConfigured(serverState);
     appendAudit({
       user_name: req.authUser.name,
       user_role: req.authUser.role,
@@ -1002,6 +1269,11 @@ async function startServer() {
   });
 
   app.get('/api/sync/state', requireAuth, (req: AuthedRequest, res) => {
+    const sinceVersionRaw = req.query.sinceVersion;
+    if (sinceVersionRaw !== undefined && Number(sinceVersionRaw) === serverState.version) {
+      res.json({ unchanged: true, version: serverState.version, serverTime: new Date().toISOString() });
+      return;
+    }
     res.json(buildRoleScopedState(req.authUser));
   });
 
@@ -1017,7 +1289,7 @@ async function startServer() {
     if (user.role !== 'SUPER_ADMIN') {
       const isOwner = student.mentor_id === user.id;
       const hasTask = serverState.campaignAssignments.some(
-        (a) => a.student_id === studentId && a.mentor_id === user.id && a.completion_status !== 'COMPLETED'
+        (a) => a.student_id === studentId && a.mentor_id === user.id
       );
       if (!isOwner && !hasTask) {
         res.status(403).json({ error: 'Access Denied: You are not authorized to call this student.' });
@@ -1115,14 +1387,14 @@ async function startServer() {
           );
 
           const attempt = {
-            id: `att-${Date.now()}`,
+            id: `att-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
             call_log_id: existingLog ? existingLog.id : '',
             contact_used: payload.contactUsed || 'PRIMARY',
             started_at: initiatedAt,
             duration_seconds: Number(payload.callDurationSec || 0),
           };
           const activity = {
-            id: `act-${Date.now()}`,
+            id: `act-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
             call_log_id: existingLog ? existingLog.id : '',
             type: 'INITIAL_SUBMIT',
             disposition_after: payload.disposition,
@@ -1218,7 +1490,7 @@ async function startServer() {
 
           broadcastStateChanged(action, user.id, [mentorId]);
           await flushPostgresPersistence();
-          res.json({ ok: true, version: serverState.version, persistedToCloud: Boolean(pgPool) });
+          res.json({ ok: true, version: serverState.version, callLog: existingLog, persistedToCloud: Boolean(pgPool) });
           return;
         }
 
@@ -1238,7 +1510,7 @@ async function startServer() {
           }
 
           const activity = {
-            id: `act-${Date.now()}`,
+            id: `act-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
             call_log_id: call.id,
             type: 'INBOUND_UPDATE',
             disposition_after: payload.newDisposition,
@@ -1290,7 +1562,7 @@ async function startServer() {
 
           broadcastStateChanged(action, user.id, [call.mentor_id]);
           await flushPostgresPersistence();
-          res.json({ ok: true, version: serverState.version, persistedToCloud: Boolean(pgPool) });
+          res.json({ ok: true, version: serverState.version, callLog: call, persistedToCloud: Boolean(pgPool) });
           return;
         }
 
@@ -1320,6 +1592,7 @@ async function startServer() {
           };
           serverState.users.push(newUser);
           const codeSynced = syncStateUsersToDefaultUsersFile(serverState);
+          void syncDefaultUsersToGitHubIfConfigured(serverState);
           appendAudit({
             user_name: user.name,
             user_role: user.role,
@@ -1364,6 +1637,7 @@ async function startServer() {
           }
           serverState.users[idx] = { ...serverState.users[idx], ...partial };
           const codeSynced = syncStateUsersToDefaultUsersFile(serverState);
+          void syncDefaultUsersToGitHubIfConfigured(serverState);
           wsClients.forEach((client) => {
             if (client.userId === payload.id) {
               client.role = serverState.users[idx].role;
@@ -1409,6 +1683,7 @@ async function startServer() {
           const removed = serverState.users[targetIdx];
           serverState.users.splice(targetIdx, 1);
           const codeSynced = syncStateUsersToDefaultUsersFile(serverState);
+          void syncDefaultUsersToGitHubIfConfigured(serverState);
           wsClients.forEach((client) => {
             if (client.userId === targetId) {
               try { client.ws.close(4001, 'Account deleted'); } catch {}
@@ -1739,6 +2014,9 @@ async function startServer() {
 
   httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`[Narayana CRM Server] Running in ${isProd ? 'PRODUCTION' : 'DEVELOPMENT'} mode on http://0.0.0.0:${PORT}`);
+    setInterval(() => {
+      void syncExternalChangesFromPostgres();
+    }, 4000);
   });
 }
 

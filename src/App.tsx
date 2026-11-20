@@ -38,6 +38,8 @@ export default function App() {
     return userRole === 'SUPER_ADMIN' ? 'dashboard' : 'assigned-calls';
   });
 
+  const [trackedMentorRequest, setTrackedMentorRequest] = useState<{ mentorId: string; ts: number } | null>(null);
+
   const [showPrismaModal, setShowPrismaModal] = useState<boolean>(false);
   const [showTestRunnerModal, setShowTestRunnerModal] = useState<boolean>(false);
 
@@ -190,7 +192,9 @@ export default function App() {
             currentUser={authenticatedUser}
             initialTab={activeTab}
             activeSessionId={activeSession.id}
+            trackedMentorRequest={trackedMentorRequest}
             onTrackMentor={(mentorId) => {
+              setTrackedMentorRequest({ mentorId, ts: Date.now() });
               setActiveTab('reports');
             }}
           />

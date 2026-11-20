@@ -21,6 +21,10 @@ import {
   UserCheck,
   FileText,
   Download,
+  RefreshCw,
+  Cloud,
+  CloudOff,
+  GitBranch,
 } from 'lucide-react';
 import { Role, User } from '../../types/crm';
 import { crmDb } from '../../services/db';
@@ -70,13 +74,52 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
   const [successToast, setSuccessToast] = useState('');
   const [isSaving, setIsSaving] = useState(false);
   const [confirmDeleteUserId, setConfirmDeleteUserId] = useState<string | null>(null);
+  const [serverHealth, setServerHealth] = useState<Awaited<ReturnType<typeof crmDb.getServerHealth>> | null>(null);
+  const [isSyncingNow, setIsSyncingNow] = useState(false);
+
+  const loadHealth = async () => {
+    const health = await crmDb.getServerHealth();
+    setServerHealth(health);
+  };
 
   const refreshList = () => {
     setUsers([...crmDb.getUsers()]);
+    void loadHealth();
     onRefreshAll();
   };
 
+  const handleSyncNow = async () => {
+    setActionError('');
+    setIsSyncingNow(true);
+    try {
+      const res = await crmDb.triggerCloudSyncNow();
+      setServerHealth({
+        ok: true,
+        appVersion: res.appVersion,
+        version: res.version,
+        persistenceMode: res.persistenceMode,
+        hostEnvironment: res.hostEnvironment,
+        githubSyncConfigured: res.githubSyncConfigured,
+        lastGithubSyncStatus: res.lastGithubSyncStatus as any,
+      });
+      setUsers([...crmDb.getUsers()]);
+      onRefreshAll();
+      const dbLabel = res.persistenceMode === 'POSTGRESQL_CLOUD' ? 'Neon Cloud DB' : 'Local Mode ONLY (DATABASE_URL missing)';
+      const ghMsg = res.lastGithubSyncStatus?.message || 'GitHub disabled';
+      if (res.lastGithubSyncStatus?.status === 'error') {
+        setActionError(`Synced ${dbLabel} (${res.usersCount} staff), but GitHub reported an error: ${ghMsg}`);
+      } else {
+        showSuccess(`Synced ${dbLabel} (${res.usersCount} staff, v${res.version}) · GitHub: ${ghMsg}`);
+      }
+    } catch (err: any) {
+      setActionError(err.message || 'Sync failed.');
+    } finally {
+      setIsSyncingNow(false);
+    }
+  };
+
   useEffect(() => {
+    void loadHealth();
     const unsubscribe = crmDb.subscribe(() => {
       setUsers([...crmDb.getUsers()]);
     });
@@ -309,6 +352,17 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
           </button>
 
           <button
+            type="button"
+            onClick={handleSyncNow}
+            disabled={isSyncingNow}
+            className="px-3.5 py-2 bg-slate-100 hover:bg-slate-200 disabled:opacity-60 text-slate-800 border border-slate-300 rounded-lg text-xs font-bold transition-all shadow-2xs flex items-center gap-1.5 cursor-pointer"
+            title="Pull latest Neon DB + sync local defaultUsers.json + commit to GitHub"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 text-emerald-700 ${isSyncingNow ? 'animate-spin' : ''}`} />
+            <span>{isSyncingNow ? 'Syncing...' : 'Sync Cloud & GitHub Now'}</span>
+          </button>
+
+          <button
             onClick={handleOpenAdd}
             className="px-4 py-2 bg-slate-950 hover:bg-slate-800 text-white rounded-lg text-xs font-bold transition-all shadow-xs flex items-center gap-2 cursor-pointer"
           >
@@ -317,6 +371,60 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
           </button>
         </div>
       </div>
+
+      {/* Live Cloud & GitHub Sync Status Bar */}
+      {serverHealth?.ok && (
+        <div
+          className={`rounded-xl border px-4 py-3 text-xs flex flex-col lg:flex-row lg:items-center justify-between gap-2.5 ${
+            serverHealth.persistenceMode === 'POSTGRESQL_CLOUD'
+              ? 'bg-emerald-50/70 border-emerald-200 text-emerald-950'
+              : 'bg-rose-50 border-rose-300 text-rose-950'
+          }`}
+        >
+          <div className="flex items-start sm:items-center gap-2.5">
+            {serverHealth.persistenceMode === 'POSTGRESQL_CLOUD' ? (
+              <Cloud className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5 sm:mt-0" />
+            ) : (
+              <CloudOff className="w-4 h-4 text-rose-600 shrink-0 mt-0.5 sm:mt-0" />
+            )}
+            <div>
+              <span className="font-bold">
+                {serverHealth.persistenceMode === 'POSTGRESQL_CLOUD'
+                  ? `Neon Cloud DB Connected (v${serverHealth.appVersion || '2.2.0'} · Sync Rev #${serverHealth.version ?? 0})`
+                  : `Local Mode Only — Cloud Sync Disconnected on ${serverHealth.hostEnvironment === 'RENDER' ? 'Render' : 'This Host'}`}
+              </span>
+              {serverHealth.persistenceMode !== 'POSTGRESQL_CLOUD' && (
+                <p className="text-[11px] text-rose-800 mt-0.5">
+                  Edits made here are NOT saved to Neon DB because <code className="font-mono font-bold">DATABASE_URL</code> is missing in this host&apos;s Environment Variables.
+                </p>
+              )}
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2 text-[11px]">
+            <GitBranch
+              className={`w-3.5 h-3.5 shrink-0 ${
+                serverHealth.lastGithubSyncStatus?.status === 'error'
+                  ? 'text-rose-600'
+                  : serverHealth.githubSyncConfigured
+                  ? 'text-blue-700'
+                  : 'text-slate-500'
+              }`}
+            />
+            <span
+              className={`font-semibold ${
+                serverHealth.lastGithubSyncStatus?.status === 'error'
+                  ? 'text-rose-800'
+                  : 'text-slate-700'
+              }`}
+            >
+              GitHub Auto-Sync:{' '}
+              {serverHealth.lastGithubSyncStatus?.message ||
+                (serverHealth.githubSyncConfigured ? 'Configured & ready' : 'Not configured on this host')}
+            </span>
+          </div>
+        </div>
+      )}
 
       {/* Search & Filters */}
       <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-2xs flex flex-wrap items-center gap-3">

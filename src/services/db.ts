@@ -147,7 +147,7 @@ class CRMDatabase {
         localStorage.setItem('narayana_crm_auth_session', JSON.stringify(data.user));
       } catch {}
 
-      await this.syncFromServer();
+      await this.syncFromServer(true);
       this.connectWebSocket();
       return { success: true, user: data.user };
     } catch {
@@ -171,7 +171,7 @@ class CRMDatabase {
       if (!res.ok) {
         // Render cold-start / 502 / 503: keep cached session and retry silently
         setTimeout(() => {
-          if (this.authToken) void this.syncFromServer();
+          if (this.authToken) void this.syncFromServer(true);
         }, 4000);
         try {
           const cached = localStorage.getItem('narayana_crm_auth_session');
@@ -181,14 +181,14 @@ class CRMDatabase {
         }
       }
       const data = await res.json();
-      await this.syncFromServer();
+      await this.syncFromServer(true);
       this.connectWebSocket();
       return data.user || null;
     } catch {
       // Network offline or server waking up from sleep: keep session active and retry
       setTimeout(() => {
         if (this.authToken) {
-          void this.syncFromServer();
+          void this.syncFromServer(true);
           this.connectWebSocket();
         }
       }, 4000);
@@ -201,10 +201,13 @@ class CRMDatabase {
     }
   }
 
-  public async syncFromServer(): Promise<boolean> {
+  public async syncFromServer(forceFull: boolean = false): Promise<boolean> {
     if (typeof window === 'undefined' || !this.authToken) return false;
     try {
-      const res = await fetch('/api/sync/state', {
+      const url = !forceFull && this.serverVersion > 0
+        ? `/api/sync/state?sinceVersion=${this.serverVersion}`
+        : '/api/sync/state';
+      const res = await fetch(url, {
         headers: { Authorization: `Bearer ${this.authToken}` },
       });
       if (res.status === 401 || res.status === 403) {
@@ -222,7 +225,7 @@ class CRMDatabase {
   }
 
   public hydrateFromServerSnapshot(snap: any) {
-    if (!snap) return;
+    if (!snap || snap.unchanged) return;
     this.isHydrating = true;
     try {
       if (typeof snap.version === 'number') this.serverVersion = snap.version;
@@ -378,7 +381,15 @@ class CRMDatabase {
     }
   }
 
-  public async getServerHealth(): Promise<{ ok: boolean; appVersion?: string; persistenceMode?: string; version?: number }> {
+  public async getServerHealth(): Promise<{
+    ok: boolean;
+    appVersion?: string;
+    persistenceMode?: string;
+    hostEnvironment?: string;
+    githubSyncConfigured?: boolean;
+    lastGithubSyncStatus?: { status: 'idle' | 'ok' | 'error' | 'disabled'; message: string; at?: string };
+    version?: number;
+  }> {
     if (typeof window === 'undefined' || typeof fetch === 'undefined') return { ok: false };
     try {
       const res = await fetch('/api/health');
@@ -387,6 +398,31 @@ class CRMDatabase {
     } catch {
       return { ok: false };
     }
+  }
+
+  public async triggerCloudSyncNow(): Promise<{
+    ok: boolean;
+    appVersion?: string;
+    version?: number;
+    usersCount?: number;
+    persistenceMode?: string;
+    hostEnvironment?: string;
+    githubSyncConfigured?: boolean;
+    lastGithubSyncStatus?: { status: string; message: string; at?: string };
+  }> {
+    if (typeof window === 'undefined' || !this.authToken) {
+      throw new Error('Not authenticated');
+    }
+    const res = await fetch('/api/admin/sync-now', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${this.authToken}` },
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data?.error || 'Failed to run cloud & GitHub sync');
+    }
+    await this.syncFromServer(true);
+    return data;
   }
 
   public async downloadServerBackup(): Promise<any> {
@@ -421,7 +457,7 @@ class CRMDatabase {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data?.error || 'Failed to restore backup');
-    await this.syncFromServer();
+    await this.syncFromServer(true);
     return data;
   }
 
@@ -1051,7 +1087,7 @@ class CRMDatabase {
     // Ownership check (Section 9.1)
     const isOwner = student.mentor_id === mentorId;
     const hasTask = this.campaignAssignments.some(
-      (a) => a.student_id === studentId && a.mentor_id === mentorId && a.completion_status !== 'COMPLETED'
+      (a) => a.student_id === studentId && a.mentor_id === mentorId
     );
     if (!isOwner && !hasTask) {
       throw new Error('Access Denied: You are not authorized to call this student.');
@@ -1090,26 +1126,23 @@ class CRMDatabase {
     };
   }
 
-  /**
-   * Submits a call disposition (Section 9.2, 9.3, 9.7):
-   * Enforces single CallLog per student per day per mentor (unique key).
-   * Appends CallAttempt and CallActivity records.
-   * Silently applies stealth anti-cheat latency evaluation.
-   */
-  public submitCallDisposition(data: {
-    studentId: string;
-    mentorId: string;
-    mentorName: string;
-    campaignId?: string;
-    campaignOutcome?: string;
-    disposition: CallDisposition;
-    remark: string;
-    followUpDate?: string;
-    followUpTime?: string;
-    callDurationSec: number;
-    initiatedAt?: string | null;
-    contactUsed?: 'PRIMARY' | 'ALTERNATE';
-  }): { callLog: CallLog; isNewRow: boolean } {
+  private applyCallDispositionLocally(
+    data: {
+      studentId: string;
+      mentorId: string;
+      mentorName: string;
+      campaignId?: string;
+      campaignOutcome?: string;
+      disposition: CallDisposition;
+      remark: string;
+      followUpDate?: string;
+      followUpTime?: string;
+      callDurationSec: number;
+      initiatedAt?: string | null;
+      contactUsed?: 'PRIMARY' | 'ALTERNATE';
+    },
+    serverCallLog?: CallLog
+  ): { callLog: CallLog; isNewRow: boolean; initiatedAt: string } {
     const todayIST = getTodayCalendarDate();
     const nowIso = new Date().toISOString();
 
@@ -1118,7 +1151,7 @@ class CRMDatabase {
 
     const sessionKey = `${data.studentId}_${data.mentorId}`;
     const activeSession = this.activeSessions.get(sessionKey);
-    const initiatedAt = activeSession?.startedAt || data.initiatedAt || nowIso;
+    const initiatedAt = serverCallLog?.first_initiated_at || activeSession?.startedAt || data.initiatedAt || nowIso;
 
     // Stealth Anti-Cheat Latency Evaluation (Section 9.7)
     const auditResult = auditCallSubmission(
@@ -1132,86 +1165,96 @@ class CRMDatabase {
     this.activeSessions.delete(sessionKey);
 
     // Check existing CallLog for this student + mentor + todayIST
-    let existingLog = this.callLogs.find(
+    const existingIdx = this.callLogs.findIndex(
       (c) => c.student_id === data.studentId && c.mentor_id === data.mentorId && c.calendar_date === todayIST
     );
+    let existingLog = existingIdx >= 0 ? this.callLogs[existingIdx] : undefined;
 
     let isNew = false;
-    const attempt: CallAttempt = {
-      id: `att-${Date.now()}`,
-      call_log_id: existingLog ? existingLog.id : '',
-      contact_used: data.contactUsed || 'PRIMARY',
-      started_at: initiatedAt,
-      duration_seconds: data.callDurationSec,
-    };
-
-    const activity: CallActivity = {
-      id: `act-${Date.now()}`,
-      call_log_id: existingLog ? existingLog.id : '',
-      type: 'INITIAL_SUBMIT',
-      disposition_after: data.disposition,
-      remark_text: data.remark.trim(),
-      reminder_after: data.followUpDate,
-      by_user: data.mentorName,
-      created_at: nowIso,
-    };
-
-    if (existingLog) {
-      // Append attempt & activity to existing log (Section 9.3)
-      attempt.call_log_id = existingLog.id;
-      activity.call_log_id = existingLog.id;
-      existingLog.attempts = [...(existingLog.attempts || []), attempt];
-      existingLog.activities = [...(existingLog.activities || []), activity];
-      existingLog.last_submitted_at = nowIso;
-      existingLog.disposition = data.disposition;
-      existingLog.campaign_outcome = data.campaignOutcome || existingLog.campaign_outcome;
-      existingLog.remark = data.remark.trim();
-      existingLog.call_duration_sec += data.callDurationSec;
-      if (auditResult.isSuspicious) {
-        existingLog.is_suspicious = true;
-        existingLog.suspicious_reason = auditResult.reason;
+    if (serverCallLog) {
+      if (existingIdx >= 0) {
+        this.callLogs[existingIdx] = serverCallLog;
+      } else {
+        isNew = true;
+        this.callLogs.unshift(serverCallLog);
       }
-      if (data.followUpDate) {
-        existingLog.follow_up_date = data.followUpDate;
-        existingLog.follow_up_time = data.followUpTime || '10:00 AM';
-        existingLog.follow_up_status = 'PENDING';
-      }
+      existingLog = serverCallLog;
     } else {
-      isNew = true;
-      const newLogId = `call-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
-      attempt.call_log_id = newLogId;
-      activity.call_log_id = newLogId;
-
-      existingLog = {
-        id: newLogId,
-        student_id: data.studentId,
-        mentor_id: data.mentorId,
-        mentor_name: data.mentorName,
-        campaign_id: data.campaignId,
-        campaign_outcome: data.campaignOutcome,
-        academic_session_id: student.academic_session_id || this.activeSessionId,
-        call_date: todayIST,
-        calendar_date: todayIST,
-        call_initiated_at: initiatedAt,
-        first_initiated_at: initiatedAt,
-        last_submitted_at: nowIso,
-        latency_seconds: auditResult.latencySeconds,
-        is_suspicious: auditResult.isSuspicious,
-        suspicious_reason: auditResult.reason,
-        disposition: data.disposition,
-        call_duration_sec: data.callDurationSec,
-        remark: data.remark.trim(),
-        call_type: 'OUTBOUND',
-        status: 'SUBMITTED',
-        is_inbound_override: false,
-        is_locked: false,
-        follow_up_date: data.followUpDate,
-        follow_up_time: data.followUpTime || '10:00 AM',
-        follow_up_status: data.followUpDate ? 'PENDING' : undefined,
-        attempts: [attempt],
-        activities: [activity],
+      const attempt: CallAttempt = {
+        id: `att-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+        call_log_id: existingLog ? existingLog.id : '',
+        contact_used: data.contactUsed || 'PRIMARY',
+        started_at: initiatedAt,
+        duration_seconds: data.callDurationSec,
       };
-      this.callLogs.unshift(existingLog);
+
+      const activity: CallActivity = {
+        id: `act-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+        call_log_id: existingLog ? existingLog.id : '',
+        type: 'INITIAL_SUBMIT',
+        disposition_after: data.disposition,
+        remark_text: data.remark.trim(),
+        reminder_after: data.followUpDate,
+        by_user: data.mentorName,
+        created_at: nowIso,
+      };
+
+      if (existingLog) {
+        attempt.call_log_id = existingLog.id;
+        activity.call_log_id = existingLog.id;
+        existingLog.attempts = [...(existingLog.attempts || []), attempt];
+        existingLog.activities = [...(existingLog.activities || []), activity];
+        existingLog.last_submitted_at = nowIso;
+        existingLog.disposition = data.disposition;
+        existingLog.campaign_outcome = data.campaignOutcome || existingLog.campaign_outcome;
+        existingLog.remark = data.remark.trim();
+        existingLog.call_duration_sec += data.callDurationSec;
+        if (auditResult.isSuspicious) {
+          existingLog.is_suspicious = true;
+          existingLog.suspicious_reason = auditResult.reason;
+        }
+        if (data.followUpDate) {
+          existingLog.follow_up_date = data.followUpDate;
+          existingLog.follow_up_time = data.followUpTime || '10:00 AM';
+          existingLog.follow_up_status = 'PENDING';
+        }
+      } else {
+        isNew = true;
+        const newLogId = `call-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
+        attempt.call_log_id = newLogId;
+        activity.call_log_id = newLogId;
+
+        existingLog = {
+          id: newLogId,
+          student_id: data.studentId,
+          mentor_id: data.mentorId,
+          mentor_name: data.mentorName,
+          campaign_id: data.campaignId,
+          campaign_outcome: data.campaignOutcome,
+          academic_session_id: student.academic_session_id || this.activeSessionId,
+          call_date: todayIST,
+          calendar_date: todayIST,
+          call_initiated_at: initiatedAt,
+          first_initiated_at: initiatedAt,
+          last_submitted_at: nowIso,
+          latency_seconds: auditResult.latencySeconds,
+          is_suspicious: auditResult.isSuspicious,
+          suspicious_reason: auditResult.reason,
+          disposition: data.disposition,
+          call_duration_sec: data.callDurationSec,
+          remark: data.remark.trim(),
+          call_type: 'OUTBOUND',
+          status: 'SUBMITTED',
+          is_inbound_override: false,
+          is_locked: false,
+          follow_up_date: data.followUpDate,
+          follow_up_time: data.followUpTime || '10:00 AM',
+          follow_up_status: data.followUpDate ? 'PENDING' : undefined,
+          attempts: [attempt],
+          activities: [activity],
+        };
+        this.callLogs.unshift(existingLog);
+      }
     }
 
     // Update Student cached state
@@ -1251,10 +1294,146 @@ class CRMDatabase {
       meta: { disposition: data.disposition, duration: data.callDurationSec, isSuspicious: auditResult.isSuspicious },
     });
 
-    this.pushActionToServer('CALL_SUBMIT', { ...data, initiatedAt });
-    this.notifyListeners();
+    return { callLog: existingLog, isNewRow: isNew, initiatedAt };
+  }
 
-    return { callLog: existingLog, isNewRow: isNew };
+  public submitCallDisposition(data: {
+    studentId: string;
+    mentorId: string;
+    mentorName: string;
+    campaignId?: string;
+    campaignOutcome?: string;
+    disposition: CallDisposition;
+    remark: string;
+    followUpDate?: string;
+    followUpTime?: string;
+    callDurationSec: number;
+    initiatedAt?: string | null;
+    contactUsed?: 'PRIMARY' | 'ALTERNATE';
+  }): { callLog: CallLog; isNewRow: boolean } {
+    const res = this.applyCallDispositionLocally(data);
+    void this.pushActionToServer('CALL_SUBMIT', { ...data, initiatedAt: res.initiatedAt });
+    this.notifyListeners();
+    return { callLog: res.callLog, isNewRow: res.isNewRow };
+  }
+
+  public async submitCallDispositionAsync(data: {
+    studentId: string;
+    mentorId: string;
+    mentorName: string;
+    campaignId?: string;
+    campaignOutcome?: string;
+    disposition: CallDisposition;
+    remark: string;
+    followUpDate?: string;
+    followUpTime?: string;
+    callDurationSec: number;
+    initiatedAt?: string | null;
+    contactUsed?: 'PRIMARY' | 'ALTERNATE';
+  }): Promise<{ callLog: CallLog; isNewRow: boolean }> {
+    const student = this.students.find((s) => s.admission_no === data.studentId);
+    if (!student) throw new Error('Student not found');
+
+    const sessionKey = `${data.studentId}_${data.mentorId}`;
+    const activeSession = this.activeSessions.get(sessionKey);
+    const initiatedAt = activeSession?.startedAt || data.initiatedAt || new Date().toISOString();
+
+    const serverRes = await this.pushActionToServer('CALL_SUBMIT', { ...data, initiatedAt });
+    if (!serverRes.ok) {
+      throw new Error(serverRes.error || 'Failed to save call log to server.');
+    }
+
+    const res = this.applyCallDispositionLocally(data, serverRes.data?.callLog);
+    this.notifyListeners();
+    return { callLog: res.callLog, isNewRow: res.isNewRow };
+  }
+
+  private applyInboundOverrideLocally(
+    params: {
+      callId: string;
+      newDisposition: CallDisposition;
+      newRemark: string;
+      newFollowUpDate?: string;
+      clearFollowUp?: boolean;
+      callerName?: string;
+    },
+    serverCallLog?: CallLog
+  ): CallLog {
+    const idx = this.callLogs.findIndex((c) => c.id === params.callId);
+    if (idx === -1) throw new Error('Call log not found');
+    const call = this.callLogs[idx];
+    if (!canOverrideInboundToday(call)) {
+      throw new Error('Call log locked: Same-day inbound callback window expires at midnight IST.');
+    }
+
+    const nowIso = new Date().toISOString();
+
+    if (serverCallLog) {
+      this.callLogs[idx] = serverCallLog;
+    } else {
+      const activity: CallActivity = {
+        id: `act-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+        call_log_id: call.id,
+        type: 'INBOUND_UPDATE',
+        disposition_after: params.newDisposition,
+        remark_text: params.newRemark.trim(),
+        reminder_after: params.clearFollowUp ? undefined : params.newFollowUpDate,
+        by_user: params.callerName || call.mentor_name,
+        created_at: nowIso,
+      };
+
+      call.activities = [...(call.activities || []), activity];
+      call.is_inbound_override = true;
+      call.original_disposition = call.original_disposition || call.disposition;
+      call.original_remark = call.original_remark || call.remark;
+      call.disposition = params.newDisposition;
+      call.remark = `${call.remark} | [Inbound Callback]: ${params.newRemark.trim()}`;
+      call.override_timestamp = nowIso;
+
+      if (params.clearFollowUp) {
+        call.follow_up_date = undefined;
+        call.follow_up_status = 'CLEARED';
+      } else if (params.newFollowUpDate) {
+        call.follow_up_date = params.newFollowUpDate;
+        call.follow_up_status = 'PENDING';
+      }
+    }
+
+    const updatedCall = this.callLogs[idx];
+
+    const student = this.students.find((s) => s.admission_no === updatedCall.student_id);
+    if (student) {
+      student.last_call_disposition = params.newDisposition;
+      if (params.newDisposition === 'CONNECTED') {
+        student.last_connected_at = nowIso;
+      }
+      student.active_reminder_date = params.clearFollowUp ? undefined : params.newFollowUpDate;
+      this.saveStudents();
+    }
+
+    const task = this.campaignAssignments.find(
+      (a) => a.student_id === updatedCall.student_id && a.mentor_id === updatedCall.mentor_id
+    );
+    if (task) {
+      if (params.newDisposition === 'CONNECTED' || params.newDisposition === 'WRONG_NUMBER') {
+        task.completion_status = 'COMPLETED';
+        task.completed_at = nowIso;
+      }
+      this.saveAssignments();
+    }
+
+    this.saveCalls();
+
+    this.logAudit({
+      user_name: updatedCall.mentor_name,
+      user_role: 'MENTOR',
+      action: 'INBOUND_UPDATE',
+      entity: 'CallLog',
+      entity_id: updatedCall.id,
+      meta: { newDisposition: params.newDisposition },
+    });
+
+    return updatedCall;
   }
 
   /**
@@ -1270,79 +1449,34 @@ class CRMDatabase {
     clearFollowUp?: boolean;
     callerName?: string;
   }): CallLog {
-    const call = this.callLogs.find((c) => c.id === params.callId);
-    if (!call) throw new Error('Call log not found');
-    if (!canOverrideInboundToday(call)) {
+    const updatedCall = this.applyInboundOverrideLocally(params);
+    void this.pushActionToServer('CALL_INBOUND_OVERRIDE', params);
+    this.notifyListeners();
+    return updatedCall;
+  }
+
+  public async overrideInboundCallbackAsync(params: {
+    callId: string;
+    newDisposition: CallDisposition;
+    newRemark: string;
+    newFollowUpDate?: string;
+    clearFollowUp?: boolean;
+    callerName?: string;
+  }): Promise<CallLog> {
+    const existing = this.callLogs.find((c) => c.id === params.callId);
+    if (!existing) throw new Error('Call log not found');
+    if (!canOverrideInboundToday(existing)) {
       throw new Error('Call log locked: Same-day inbound callback window expires at midnight IST.');
     }
 
-    const nowIso = new Date().toISOString();
-
-    const activity: CallActivity = {
-      id: `act-${Date.now()}`,
-      call_log_id: call.id,
-      type: 'INBOUND_UPDATE',
-      disposition_after: params.newDisposition,
-      remark_text: params.newRemark.trim(),
-      reminder_after: params.clearFollowUp ? undefined : params.newFollowUpDate,
-      by_user: params.callerName || call.mentor_name,
-      created_at: nowIso,
-    };
-
-    call.activities = [...(call.activities || []), activity];
-    call.is_inbound_override = true;
-    call.original_disposition = call.original_disposition || call.disposition;
-    call.original_remark = call.original_remark || call.remark;
-    call.disposition = params.newDisposition;
-    call.remark = `${call.remark} | [Inbound Callback]: ${params.newRemark.trim()}`;
-    call.override_timestamp = nowIso;
-
-    if (params.clearFollowUp) {
-      call.follow_up_date = undefined;
-      call.follow_up_status = 'CLEARED';
-    } else if (params.newFollowUpDate) {
-      call.follow_up_date = params.newFollowUpDate;
-      call.follow_up_status = 'PENDING';
+    const serverRes = await this.pushActionToServer('CALL_INBOUND_OVERRIDE', params);
+    if (!serverRes.ok) {
+      throw new Error(serverRes.error || 'Failed to save inbound callback on server.');
     }
 
-    // Update Student
-    const student = this.students.find((s) => s.admission_no === call.student_id);
-    if (student) {
-      student.last_call_disposition = params.newDisposition;
-      if (params.newDisposition === 'CONNECTED') {
-        student.last_connected_at = nowIso;
-      }
-      student.active_reminder_date = params.clearFollowUp ? undefined : params.newFollowUpDate;
-      this.saveStudents();
-    }
-
-    // Recalculate Task
-    const task = this.campaignAssignments.find(
-      (a) => a.student_id === call.student_id && a.mentor_id === call.mentor_id
-    );
-    if (task) {
-      if (params.newDisposition === 'CONNECTED' || params.newDisposition === 'WRONG_NUMBER') {
-        task.completion_status = 'COMPLETED';
-        task.completed_at = nowIso;
-      }
-      this.saveAssignments();
-    }
-
-    this.saveCalls();
-
-    this.logAudit({
-      user_name: call.mentor_name,
-      user_role: 'MENTOR',
-      action: 'INBOUND_UPDATE',
-      entity: 'CallLog',
-      entity_id: call.id,
-      meta: { newDisposition: params.newDisposition },
-    });
-
-    this.pushActionToServer('CALL_INBOUND_OVERRIDE', params);
+    const updatedCall = this.applyInboundOverrideLocally(params, serverRes.data?.callLog);
     this.notifyListeners();
-
-    return call;
+    return updatedCall;
   }
 
   // --------------------------------------------------------------------------

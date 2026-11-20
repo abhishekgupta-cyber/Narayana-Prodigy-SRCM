@@ -71,6 +71,7 @@ interface AdminDashboardProps {
   currentUser: User;
   initialTab?: string;
   activeSessionId?: string;
+  trackedMentorRequest?: { mentorId: string; ts: number } | null;
   onTrackMentor?: (mentorId: string) => void;
 }
 
@@ -78,6 +79,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   currentUser,
   initialTab = 'dashboard',
   activeSessionId,
+  trackedMentorRequest,
   onTrackMentor,
 }) => {
   const [activeTab, setActiveTab] = useState<string>(initialTab);
@@ -85,6 +87,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   useEffect(() => {
     if (initialTab) setActiveTab(initialTab);
   }, [initialTab]);
+
+  useEffect(() => {
+    if (trackedMentorRequest?.mentorId) {
+      setSelectedMentorForDeepDive(trackedMentorRequest.mentorId);
+      setActiveTab('reports');
+      setReportSubTab('MENTOR_TRACKING');
+    }
+  }, [trackedMentorRequest?.ts]);
 
   const [analytics, setAnalytics] = useState<CallAnalytics | null>(null);
 
@@ -157,8 +167,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const [reportBatchName, setReportBatchName] = useState('ALL');
   const [reportDisposition, setReportDisposition] = useState('ALL');
 
-  // Tracking specific mentor deep-dive state
+  // Tracking specific mentor deep-dive & 100+ staff filters
   const [selectedMentorForDeepDive, setSelectedMentorForDeepDive] = useState<string>('');
+  const [mentorMatrixSearch, setMentorMatrixSearch] = useState<string>('');
+  const [mentorMatrixFilter, setMentorMatrixFilter] = useState<'ALL' | 'CALLED_TODAY' | 'ZERO_TODAY' | 'HAS_PENDING'>('ALL');
+  const [trackingStaffSearch, setTrackingStaffSearch] = useState<string>('');
+  const [trackingFromDate, setTrackingFromDate] = useState<string>('');
+  const [trackingToDate, setTrackingToDate] = useState<string>('');
+  const [trackingDispFilter, setTrackingDispFilter] = useState<string>('ALL');
 
   // Settings State (Section 12)
   const [settings, setSettings] = useState(crmDb.getSettings());
@@ -577,81 +593,127 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           </div>
 
           {/* Mentor Performance Spreadsheet Table (Section 6: Click row opens Mentor Tracking) */}
-          <div className="bg-white border border-slate-200 rounded-xl shadow-2xs overflow-hidden">
-            <div className="p-4 border-b border-slate-200 bg-slate-50/50 flex items-center justify-between">
-              <div>
-                <h3 className="text-sm font-bold text-slate-900">
-                  Mentor Performance & Call Allocation Matrix
-                </h3>
-                <p className="text-xs text-slate-500">
-                  Click any mentor row to open their 1-to-1 call tracking report and complete remark timeline.
-                </p>
-              </div>
-              <span className="text-xs font-mono font-bold text-slate-600">
-                {analytics.mentorPerformance.length} Calling Mentors
-              </span>
-            </div>
+          {(() => {
+            const q = mentorMatrixSearch.trim().toLowerCase();
+            const filteredMentors = analytics.mentorPerformance.filter((m) => {
+              if (q && !m.mentorName.toLowerCase().includes(q) && !m.designation.toLowerCase().includes(q)) {
+                return false;
+              }
+              if (mentorMatrixFilter === 'CALLED_TODAY' && m.completedCalls <= 0) return false;
+              if (mentorMatrixFilter === 'ZERO_TODAY' && m.completedCalls > 0) return false;
+              if (mentorMatrixFilter === 'HAS_PENDING' && m.pendingOverdue <= 0 && m.remindersDue <= 0) return false;
+              return true;
+            });
 
-            <div className="overflow-x-auto">
-              <table className="w-full text-left border-collapse text-xs">
-                <thead>
-                  <tr className="bg-slate-100/80 border-b border-slate-200 text-slate-700 font-bold uppercase tracking-wider text-[11px]">
-                    <th className="py-3 px-4">Mentor Name</th>
-                    <th className="py-3 px-4">Designation</th>
-                    <th className="py-3 px-4 text-center">Total Assigned</th>
-                    <th className="py-3 px-4 text-center">New Calls</th>
-                    <th className="py-3 px-4 text-center">Completed</th>
-                    <th className="py-3 px-4 text-center">Pending / Overdue</th>
-                    <th className="py-3 px-4 text-center">Reminders Due</th>
-                    <th className="py-3 px-4 text-center">Monthly Overdue</th>
-                    <th className="py-3 px-4 text-right">Deep Dive</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-200">
-                  {analytics.mentorPerformance.map((m) => (
-                    <tr
-                      key={m.mentorId}
-                      onClick={() => {
-                        setSelectedMentorForDeepDive(m.mentorId);
-                        setActiveTab('reports');
-                        setReportSubTab('MENTOR_TRACKING');
-                      }}
-                      className="hover:bg-amber-50/50 cursor-pointer transition-colors"
+            return (
+              <div className="bg-white border border-slate-200 rounded-xl shadow-2xs overflow-hidden">
+                <div className="p-4 border-b border-slate-200 bg-slate-50/50 flex flex-col md:flex-row md:items-center justify-between gap-3">
+                  <div>
+                    <h3 className="text-sm font-bold text-slate-900">
+                      Mentor Performance & Call Allocation Matrix ({filteredMentors.length} of {analytics.mentorPerformance.length})
+                    </h3>
+                    <p className="text-xs text-slate-500">
+                      Click any mentor row to open their 1-to-1 call tracking report and complete remark timeline.
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="relative">
+                      <Search className="w-3.5 h-3.5 absolute left-2.5 top-2 text-slate-400" />
+                      <input
+                        type="text"
+                        placeholder="Search mentor or role..."
+                        value={mentorMatrixSearch}
+                        onChange={(e) => setMentorMatrixSearch(e.target.value)}
+                        className="pl-8 pr-3 py-1.5 text-xs border border-slate-300 rounded-lg bg-white focus:outline-none focus:ring-1 focus:ring-amber-500 w-48"
+                      />
+                    </div>
+                    <select
+                      value={mentorMatrixFilter}
+                      onChange={(e) => setMentorMatrixFilter(e.target.value as any)}
+                      className="px-2.5 py-1.5 text-xs border border-slate-300 rounded-lg bg-white font-semibold cursor-pointer"
                     >
-                      <td className="py-3 px-4 font-bold text-slate-900 flex items-center gap-2">
-                        <span>{m.mentorName}</span>
-                      </td>
-                      <td className="py-3 px-4 text-slate-600">{m.designation}</td>
-                      <td className="py-3 px-4 text-center font-mono font-bold text-slate-800">
-                        {m.totalAssigned}
-                      </td>
-                      <td className="py-3 px-4 text-center font-mono text-blue-700 font-semibold">
-                        {m.newCalls}
-                      </td>
-                      <td className="py-3 px-4 text-center font-mono text-emerald-700 font-semibold">
-                        {m.completedCalls}
-                      </td>
-                      <td className="py-3 px-4 text-center font-mono text-amber-700 font-semibold">
-                        {m.pendingOverdue}
-                      </td>
-                      <td className="py-3 px-4 text-center font-mono text-rose-700 font-semibold">
-                        {m.remindersDue}
-                      </td>
-                      <td className="py-3 px-4 text-center font-mono text-purple-700 font-semibold">
-                        {m.monthlyOverdue}
-                      </td>
-                      <td className="py-3 px-4 text-right">
-                        <span className="text-[11px] font-bold text-amber-700 hover:underline flex items-center justify-end gap-1">
-                          <span>Track</span>
-                          <ChevronRight className="w-3 h-3" />
-                        </span>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
+                      <option value="ALL">All Calling Staff</option>
+                      <option value="CALLED_TODAY">Active Today (&gt;0 calls)</option>
+                      <option value="ZERO_TODAY">0 Calls Today</option>
+                      <option value="HAS_PENDING">Has Pending / Reminders</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div className="overflow-x-auto max-h-[520px] overflow-y-auto">
+                  <table className="w-full text-left border-collapse text-xs">
+                    <thead className="sticky top-0 z-10 bg-slate-100">
+                      <tr className="border-b border-slate-200 text-slate-700 font-bold uppercase tracking-wider text-[11px]">
+                        <th className="py-3 px-4">Mentor Name</th>
+                        <th className="py-3 px-4">Designation</th>
+                        <th className="py-3 px-4 text-center">Total Assigned</th>
+                        <th className="py-3 px-4 text-center">New Calls</th>
+                        <th className="py-3 px-4 text-center">Called Today</th>
+                        <th className="py-3 px-4 text-center">Target %</th>
+                        <th className="py-3 px-4 text-center">Pending / Overdue</th>
+                        <th className="py-3 px-4 text-center">Reminders Due</th>
+                        <th className="py-3 px-4 text-center">Monthly Overdue</th>
+                        <th className="py-3 px-4 text-right">Deep Dive</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-200">
+                      {filteredMentors.length === 0 ? (
+                        <tr>
+                          <td colSpan={10} className="py-10 text-center text-slate-400">
+                            No mentors matching current filter.
+                          </td>
+                        </tr>
+                      ) : (
+                        filteredMentors.map((m) => (
+                          <tr
+                            key={m.mentorId}
+                            onClick={() => {
+                              setSelectedMentorForDeepDive(m.mentorId);
+                              setActiveTab('reports');
+                              setReportSubTab('MENTOR_TRACKING');
+                            }}
+                            className="hover:bg-amber-50/50 cursor-pointer transition-colors"
+                          >
+                            <td className="py-3 px-4 font-bold text-slate-900">
+                              <span>{m.mentorName}</span>
+                            </td>
+                            <td className="py-3 px-4 text-slate-600">{m.designation}</td>
+                            <td className="py-3 px-4 text-center font-mono font-bold text-slate-800">
+                              {m.totalAssigned}
+                            </td>
+                            <td className="py-3 px-4 text-center font-mono text-blue-700 font-semibold">
+                              {m.newCalls}
+                            </td>
+                            <td className="py-3 px-4 text-center font-mono text-emerald-700 font-semibold">
+                              {m.completedCalls}
+                            </td>
+                            <td className="py-3 px-4 text-center font-mono font-bold text-slate-700">
+                              {m.completionRate}%
+                            </td>
+                            <td className="py-3 px-4 text-center font-mono text-amber-700 font-semibold">
+                              {m.pendingOverdue}
+                            </td>
+                            <td className="py-3 px-4 text-center font-mono text-rose-700 font-semibold">
+                              {m.remindersDue}
+                            </td>
+                            <td className="py-3 px-4 text-center font-mono text-purple-700 font-semibold">
+                              {m.monthlyOverdue}
+                            </td>
+                            <td className="py-3 px-4 text-right">
+                              <span className="text-[11px] font-bold text-amber-700 hover:underline flex items-center justify-end gap-1">
+                                <span>Track</span>
+                                <ChevronRight className="w-3 h-3" />
+                              </span>
+                            </td>
+                          </tr>
+                        ))
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            );
+          })()}
         </div>
       )}
 
@@ -2100,56 +2162,160 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           )}
 
           {/* Report Content: C) Mentor Tracking 1-to-1 Deep Dive */}
-          {reportSubTab === 'MENTOR_TRACKING' && (
-            <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-2xs space-y-4 text-xs">
-              <div className="flex flex-col sm:flex-row items-center justify-between gap-3">
-                <div className="flex items-center gap-3">
+          {reportSubTab === 'MENTOR_TRACKING' && (() => {
+            const allActiveStaff = crmDb
+              .getUsers()
+              .filter((u) => u.status !== 'INACTIVE')
+              .sort((a, b) => {
+                if (a.role === b.role) return a.name.localeCompare(b.name);
+                return a.role === 'MENTOR' ? -1 : 1;
+              });
+            const staffQuery = trackingStaffSearch.trim().toLowerCase();
+            const filteredStaff = staffQuery
+              ? allActiveStaff.filter(
+                  (u) =>
+                    u.name.toLowerCase().includes(staffQuery) ||
+                    u.email.toLowerCase().includes(staffQuery) ||
+                    (u.department && u.department.toLowerCase().includes(staffQuery))
+                )
+              : allActiveStaff;
+
+            const fallbackId = filteredStaff[0]?.id || mentorsList[0]?.id || allActiveStaff[0]?.id;
+            const mId =
+              selectedMentorForDeepDive && allActiveStaff.some((u) => u.id === selectedMentorForDeepDive)
+                ? selectedMentorForDeepDive
+                : fallbackId;
+
+            const rep = mId
+              ? crmDb.getMentorTracking(mId, trackingFromDate || undefined, trackingToDate || undefined)
+              : null;
+
+            const visibleCalls = rep
+              ? rep.calls.filter((c) => {
+                  if (trackingDispFilter === 'SUSPICIOUS_ONLY') return Boolean(c.is_suspicious);
+                  if (trackingDispFilter !== 'ALL') return c.disposition === trackingDispFilter;
+                  return true;
+                })
+              : [];
+
+            return (
+              <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-2xs space-y-4 text-xs">
+                <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
                   <div>
-                    <h3 className="font-bold text-slate-900 text-sm">C) 1-to-1 Mentor Tracking Deep Dive</h3>
-                    <p className="text-slate-500 text-[11px]">Every call, attempt, latency, and all remarks in chronological order</p>
+                    <h3 className="font-bold text-slate-900 text-sm">C) 1-to-1 Staff & Mentor Tracking Deep Dive</h3>
+                    <p className="text-slate-500 text-[11px]">
+                      Search across 100+ Mentors & Staff — inspect every call, attempt count, latency, follow-up, and full remark timeline
+                    </p>
                   </div>
-                  <select
-                    value={selectedMentorForDeepDive || mentorsList[0]?.id}
-                    onChange={(e) => setSelectedMentorForDeepDive(e.target.value)}
-                    className="p-1.5 border border-slate-300 rounded font-bold bg-white cursor-pointer"
-                  >
-                    {mentorsList.map((m) => (
-                      <option key={m.id} value={m.id}>{m.name}</option>
-                    ))}
-                  </select>
+
+                  {rep && (
+                    <button
+                      onClick={() => {
+                        exportMentorTrackingToExcel({
+                          mentorName: rep.mentor.name,
+                          designation: rep.mentor.department || 'Senior Academic Mentor',
+                          totalAssigned: rep.totalAssignedTasks,
+                          completed: rep.completedTasks,
+                          pending: rep.pendingTasks,
+                          suspiciousCount: rep.suspiciousCount,
+                          calls: visibleCalls,
+                        });
+                      }}
+                      className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded flex items-center gap-1.5 cursor-pointer self-start lg:self-auto"
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      <span>Download Staff Excel</span>
+                    </button>
+                  )}
                 </div>
 
-                <button
-                  onClick={() => {
-                    const mId = selectedMentorForDeepDive || mentorsList[0]?.id;
-                    if (mId) {
-                      const rep = crmDb.getMentorTracking(mId);
-                      exportMentorTrackingToExcel({
-                        mentorName: rep.mentor.name,
-                        designation: rep.mentor.department || 'Senior Academic Mentor',
-                        totalAssigned: rep.totalAssignedTasks,
-                        completed: rep.completedTasks,
-                        pending: rep.pendingTasks,
-                        suspiciousCount: rep.suspiciousCount,
-                        calls: rep.calls,
-                      });
-                    }
-                  }}
-                  className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded flex items-center gap-1.5 cursor-pointer"
-                >
-                  <Download className="w-3.5 h-3.5" />
-                  <span>Download Mentor Excel</span>
-                </button>
-              </div>
+                {/* Search + Staff Selector + Date & Disposition Filters */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 bg-slate-50 p-3 rounded-lg border border-slate-200">
+                  <div>
+                    <label className="block text-[10px] font-bold text-slate-500 uppercase mb-1">Find Staff (100+ Ready)</label>
+                    <div className="relative">
+                      <Search className="w-3.5 h-3.5 absolute left-2.5 top-2 text-slate-400" />
+                      <input
+                        type="text"
+                        placeholder="Filter name / role..."
+                        value={trackingStaffSearch}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setTrackingStaffSearch(val);
+                          const q = val.trim().toLowerCase();
+                          if (q) {
+                            const match = allActiveStaff.find(
+                              (u) =>
+                                u.name.toLowerCase().includes(q) ||
+                                u.email.toLowerCase().includes(q) ||
+                                (u.department && u.department.toLowerCase().includes(q))
+                            );
+                            if (match) setSelectedMentorForDeepDive(match.id);
+                          }
+                        }}
+                        className="w-full pl-8 pr-2.5 py-1.5 border border-slate-300 rounded bg-white text-xs"
+                      />
+                    </div>
+                  </div>
 
-              {(() => {
-                const mId = selectedMentorForDeepDive || mentorsList[0]?.id;
-                if (!mId) return null;
-                const rep = crmDb.getMentorTracking(mId);
+                  <div>
+                    <label className="block text-[10px] font-bold text-slate-500 uppercase mb-1">
+                      Selected Staff ({filteredStaff.length})
+                    </label>
+                    <select
+                      value={mId || ''}
+                      onChange={(e) => setSelectedMentorForDeepDive(e.target.value)}
+                      className="w-full p-1.5 border border-slate-300 rounded font-bold bg-white cursor-pointer"
+                    >
+                      {filteredStaff.map((m) => (
+                        <option key={m.id} value={m.id}>
+                          {m.name} ({m.role === 'SUPER_ADMIN' ? 'Admin' : 'Mentor'})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
 
-                return (
+                  <div>
+                    <label className="block text-[10px] font-bold text-slate-500 uppercase mb-1">From Date (IST)</label>
+                    <input
+                      type="date"
+                      value={trackingFromDate}
+                      onChange={(e) => setTrackingFromDate(e.target.value)}
+                      className="w-full p-1.5 border border-slate-300 rounded bg-white"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-[10px] font-bold text-slate-500 uppercase mb-1">To Date (IST)</label>
+                    <input
+                      type="date"
+                      value={trackingToDate}
+                      onChange={(e) => setTrackingToDate(e.target.value)}
+                      className="w-full p-1.5 border border-slate-300 rounded bg-white"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-[10px] font-bold text-slate-500 uppercase mb-1">Filter Disposition</label>
+                    <select
+                      value={trackingDispFilter}
+                      onChange={(e) => setTrackingDispFilter(e.target.value)}
+                      className="w-full p-1.5 border border-slate-300 rounded bg-white font-semibold cursor-pointer"
+                    >
+                      <option value="ALL">All Call Results</option>
+                      <option value="CONNECTED">Connected Only</option>
+                      <option value="CALLBACK_REQUESTED">Callback Requested</option>
+                      <option value="BUSY">Busy</option>
+                      <option value="RINGING_NO_RESPONSE">No Response</option>
+                      <option value="SWITCHED_OFF">Switched Off</option>
+                      <option value="SUSPICIOUS_ONLY">Flagged (&lt;15s Latency)</option>
+                    </select>
+                  </div>
+                </div>
+
+                {rep && (
                   <div className="space-y-4">
-                    <div className="grid grid-cols-4 gap-3 text-center font-mono">
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-center font-mono">
                       <div className="bg-slate-50 p-2.5 rounded border border-slate-200">
                         <span className="text-[10px] text-slate-500 block">ASSIGNED TASKS</span>
                         <span className="text-lg font-bold">{rep.totalAssignedTasks}</span>
@@ -2159,8 +2325,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                         <span className="text-lg font-bold text-emerald-700">{rep.completedTasks}</span>
                       </div>
                       <div className="bg-slate-50 p-2.5 rounded border border-slate-200">
-                        <span className="text-[10px] text-slate-500 block">TOTAL CALLS</span>
-                        <span className="text-lg font-bold">{rep.totalCalls}</span>
+                        <span className="text-[10px] text-slate-500 block">FILTERED CALLS</span>
+                        <span className="text-lg font-bold">{visibleCalls.length}</span>
                       </div>
                       <div className="bg-slate-50 p-2.5 rounded border border-slate-200">
                         <span className="text-[10px] text-slate-500 block">SUSPICIOUS (&lt;15s)</span>
@@ -2172,51 +2338,67 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                       <table className="w-full text-left text-xs">
                         <thead>
                           <tr className="bg-slate-100 text-slate-700 font-bold uppercase text-[10px]">
-                            <th className="py-2.5 px-3">Date (IST)</th>
-                            <th className="py-2.5 px-3">Student Adm #</th>
+                            <th className="py-2.5 px-3">Date &amp; Time (IST)</th>
+                            <th className="py-2.5 px-3">Student &amp; Adm #</th>
                             <th className="py-2.5 px-3">Disposition</th>
-                            <th className="py-2.5 px-3">Duration</th>
+                            <th className="py-2.5 px-3">Duration / Attempts</th>
                             <th className="py-2.5 px-3">Latency</th>
+                            <th className="py-2.5 px-3">Follow-up</th>
                             <th className="py-2.5 px-3">Remarks</th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-200">
-                          {rep.calls.length === 0 ? (
+                          {visibleCalls.length === 0 ? (
                             <tr>
-                              <td colSpan={6} className="py-6 text-center text-slate-400">
-                                No calls logged by this mentor yet.
+                              <td colSpan={7} className="py-6 text-center text-slate-400">
+                                No calls matching selected filters for {rep.mentor.name}.
                               </td>
                             </tr>
                           ) : (
-                            rep.calls.map((c) => (
-                              <tr key={c.id} className="hover:bg-slate-50">
-                                <td className="py-2.5 px-3 font-mono text-slate-600">{formatISTDateTime(c.call_initiated_at)}</td>
-                                <td className="py-2.5 px-3 font-mono font-bold">#{c.student_id}</td>
-                                <td className="py-2.5 px-3">
-                                  <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-slate-100">
-                                    {c.disposition}
-                                  </span>
-                                </td>
-                                <td className="py-2.5 px-3 font-mono">{c.call_duration_sec}s</td>
-                                <td className="py-2.5 px-3 font-mono">
-                                  {c.is_suspicious ? (
-                                    <span className="text-rose-700 font-bold">{c.latency_seconds}s (Flagged)</span>
-                                  ) : (
-                                    <span>{c.latency_seconds}s</span>
-                                  )}
-                                </td>
-                                <td className="py-2.5 px-3 text-slate-800">{c.remark}</td>
-                              </tr>
-                            ))
+                            visibleCalls.map((c) => {
+                              const stObj = crmDb.getStudentByAdmissionNo(c.student_id, 'SUPER_ADMIN');
+                              return (
+                                <tr key={c.id} className="hover:bg-slate-50">
+                                  <td className="py-2.5 px-3 font-mono text-slate-600 whitespace-nowrap">
+                                    {formatISTDateTime(c.last_submitted_at || c.call_initiated_at)}
+                                  </td>
+                                  <td className="py-2.5 px-3">
+                                    <div className="font-bold text-slate-900">{stObj?.user_name || 'Student'}</div>
+                                    <div className="font-mono text-[10px] text-slate-500">
+                                      #{c.student_id}{stObj?.batch_name ? ` · ${stObj.batch_name}` : ''}
+                                    </div>
+                                  </td>
+                                  <td className="py-2.5 px-3">
+                                    <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-slate-100">
+                                      {c.disposition}
+                                    </span>
+                                  </td>
+                                  <td className="py-2.5 px-3 font-mono whitespace-nowrap">
+                                    {c.call_duration_sec}s ({c.attempts?.length || 1}x)
+                                  </td>
+                                  <td className="py-2.5 px-3 font-mono whitespace-nowrap">
+                                    {c.is_suspicious ? (
+                                      <span className="text-rose-700 font-bold">{c.latency_seconds}s (Flagged)</span>
+                                    ) : (
+                                      <span>{c.latency_seconds}s</span>
+                                    )}
+                                  </td>
+                                  <td className="py-2.5 px-3 font-mono text-slate-600 whitespace-nowrap">
+                                    {c.follow_up_date || '—'}
+                                  </td>
+                                  <td className="py-2.5 px-3 text-slate-800">{c.remark}</td>
+                                </tr>
+                              );
+                            })
                           )}
                         </tbody>
                       </table>
                     </div>
                   </div>
-                );
-              })()}
-            </div>
-          )}
+                )}
+              </div>
+            );
+          })()}
 
           {/* Report Content: D) Batch-Wise Call Audit (IOQM case, including 0-call students) */}
           {reportSubTab === 'BATCH_AUDIT' && (

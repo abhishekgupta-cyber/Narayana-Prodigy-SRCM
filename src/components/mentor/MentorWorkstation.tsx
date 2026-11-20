@@ -127,6 +127,7 @@ export const MentorWorkstation: React.FC<MentorWorkstationProps> = ({
   const [inboundNewRemark, setInboundNewRemark] = useState('');
   const [inboundFollowUpDate, setInboundFollowUpDate] = useState('');
   const [inboundClearFollowUp, setInboundClearFollowUp] = useState(false);
+  const [inboundSubmitting, setInboundSubmitting] = useState(false);
   const [inboundError, setInboundError] = useState('');
 
   // Live IST Watermark & Blur-on-Unfocus (Section 12)
@@ -258,9 +259,9 @@ export const MentorWorkstation: React.FC<MentorWorkstationProps> = ({
   };
 
   // Submit Call Disposition (Section 9.2 & 9.7: Silent latency logging, no mentor alert)
-  const handleSubmitCall = (e: React.FormEvent) => {
+  const handleSubmitCall = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!activeCallingStudent) return;
+    if (!activeCallingStudent || modalSubmitting) return;
 
     if (!modalRemark.trim()) {
       setModalError('Please enter a conversation remark before saving.');
@@ -271,7 +272,7 @@ export const MentorWorkstation: React.FC<MentorWorkstationProps> = ({
     setModalError('');
 
     try {
-      crmDb.submitCallDisposition({
+      await crmDb.submitCallDispositionAsync({
         studentId: activeCallingStudent.admission_no,
         mentorId: currentUser.id,
         mentorName: currentUser.name,
@@ -287,7 +288,7 @@ export const MentorWorkstation: React.FC<MentorWorkstationProps> = ({
       });
 
       handleCloseCallModal();
-      showToast('Call logged successfully.');
+      showToast('Call & remark saved to Cloud DB.');
       loadData();
     } catch (err: any) {
       setModalError(err.message || 'Failed to log call.');
@@ -297,18 +298,19 @@ export const MentorWorkstation: React.FC<MentorWorkstationProps> = ({
   };
 
   // Same-Day Inbound Callback Save (Section 9.5)
-  const handleSaveInboundOverride = (e: React.FormEvent) => {
+  const handleSaveInboundOverride = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!inboundCallToEdit) return;
+    if (!inboundCallToEdit || inboundSubmitting) return;
 
     if (!inboundNewRemark.trim()) {
       setInboundError('Please enter details of the parent callback.');
       return;
     }
+    setInboundSubmitting(true);
     setInboundError('');
 
     try {
-      crmDb.overrideInboundCallback({
+      await crmDb.overrideInboundCallbackAsync({
         callId: inboundCallToEdit.id,
         newDisposition: inboundNewDisposition,
         newRemark: inboundNewRemark,
@@ -318,10 +320,12 @@ export const MentorWorkstation: React.FC<MentorWorkstationProps> = ({
       });
 
       setInboundCallToEdit(null);
-      showToast('Inbound callback updated successfully.');
+      showToast('Inbound callback saved to Cloud DB.');
       loadData();
     } catch (err: any) {
       setInboundError(err.message || 'Failed to save callback update.');
+    } finally {
+      setInboundSubmitting(false);
     }
   };
 
@@ -1215,9 +1219,10 @@ export const MentorWorkstation: React.FC<MentorWorkstationProps> = ({
                 </button>
                 <button
                   type="submit"
-                  className="px-5 py-2 bg-slate-950 hover:bg-slate-800 text-white font-bold rounded-lg cursor-pointer"
+                  disabled={inboundSubmitting}
+                  className="px-5 py-2 bg-slate-950 hover:bg-slate-800 disabled:opacity-60 text-white font-bold rounded-lg cursor-pointer"
                 >
-                  Append Inbound Callback
+                  {inboundSubmitting ? 'Saving...' : 'Append Inbound Callback'}
                 </button>
               </div>
             </form>
